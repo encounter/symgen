@@ -37,7 +37,7 @@ pub fn run(args: Args) -> Result<()> {
     let (data, entries) = build_manifest(&input)?;
     fs::write(&args.out, &data)
         .with_context(|| format!("Failed to write manifest '{}'", args.out.display()))?;
-    log::info!(
+    log::debug!(
         "Wrote {} entries ({} raw records), {} bytes, build id {}",
         entries,
         input.symbols.len(),
@@ -200,7 +200,7 @@ fn read_pdb(path: &Path) -> Result<ManifestInput> {
         }
     }
     if !flagged_rvas.is_empty() {
-        log::info!(
+        log::debug!(
             "{} functions have inline sites ({} records flagged)",
             flagged_rvas.len(),
             flagged_count

@@ -151,7 +151,7 @@ pub fn build_manifest(input: &ManifestInput) -> Result<(Vec<u8>, usize)> {
     }
     entries.sort_unstable_by_key(|e| (e.hash.get(), e.name_off.get(), e.rva.get()));
     if dup_names != 0 {
-        log::info!("{dup_names} names have multiple addresses (flagged DUP_NAME)");
+        log::debug!("{dup_names} names have multiple addresses (flagged DUP_NAME)");
     }
 
     let build_id_len = input.build_id.len().min(32);
