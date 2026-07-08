@@ -9,8 +9,8 @@ use argp::FromArgs;
 use pdb::FallibleIterator;
 
 use crate::util::manifest::{
-    FLAG_CODE, FLAG_DATA, FLAG_DISPLAY, FLAG_INLINE_SITES, FLAG_LOCAL, ManifestInput,
-    ManifestSymbol, build_manifest,
+    FLAG_CODE, FLAG_DATA, FLAG_DISPLAY, FLAG_INLINE_SITES, FLAG_LOCAL, ManifestCompression,
+    ManifestInput, ManifestOptions, ManifestSymbol, build_manifest_with_options,
 };
 
 #[derive(FromArgs, PartialEq, Eq, Debug)]
@@ -26,6 +26,9 @@ pub struct Args {
     #[argp(option, short = 'o')]
     /// output manifest file
     out: PathBuf,
+    #[argp(switch)]
+    /// disable zstd compression
+    no_compress: bool,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -34,14 +37,17 @@ pub fn run(args: Args) -> Result<()> {
         (None, Some(binary)) => read_binary(binary)?,
         (None, None) => bail!("Either --pdb (Windows) or --binary is required"),
     };
-    let (data, entries) = build_manifest(&input)?;
+    let compression =
+        if args.no_compress { ManifestCompression::None } else { ManifestCompression::Zstd };
+    let (data, entries) = build_manifest_with_options(&input, ManifestOptions { compression })?;
     fs::write(&args.out, &data)
         .with_context(|| format!("Failed to write manifest '{}'", args.out.display()))?;
     log::debug!(
-        "Wrote {} entries ({} raw records), {} bytes, build id {}",
+        "Wrote {} entries ({} raw records), {} bytes, {} compression, build id {}",
         entries,
         input.symbols.len(),
         data.len(),
+        compression.name(),
         input.build_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
     );
     Ok(())

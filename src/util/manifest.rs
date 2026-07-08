@@ -1,11 +1,17 @@
 //! Symbol manifest format.
 //!
-//! Layout (little-endian, designed to be memory-mapped by a mod loader):
+//! Layout (little-endian):
 //!
 //! ```text
-//! Header  { magic "SYMGEN\0\0", version u32, entry_count u32,
-//!           build_id_len u32, build_id [u8; 32], reserved u32,
-//!           strings_off u64, strings_len u64 }             (72 bytes; entries 8-aligned)
+//! Header  { magic "SYMGEN\0\0", version u32, compression ManifestCompression,
+//!           uncompressed_len u64, compressed_len u64,
+//!           build_id_len u32, build_id [u8; 32], entry_count u32 } (72 bytes)
+//! Payload  compressed_len bytes, optionally zstd-compressed
+//! ```
+//!
+//! The decompressed payload contains the entries and string table:
+//!
+//! ```text
 //! Entry   { hash u64, rva u64, name_off u32, flags u32 }   × entry_count,
 //!           sorted by (hash, name_off) — binary-search by hash, resolve
 //!           collisions by comparing the name.
@@ -28,7 +34,36 @@ use zerocopy::{
 use crate::static_assert;
 
 pub const MAGIC: [u8; 8] = *b"SYMGEN\0\0";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
+pub const ZSTD_LEVEL: i32 = 10;
+
+/// Manifest payload compression stored in ManifestHeader::compression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ManifestCompression {
+    None = 0,
+    Zstd = 1,
+}
+
+impl ManifestCompression {
+    pub const fn code(self) -> u32 { self as u32 }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Zstd => "zstd",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManifestOptions {
+    pub compression: ManifestCompression,
+}
+
+impl Default for ManifestOptions {
+    fn default() -> Self { Self { compression: ManifestCompression::Zstd } }
+}
 
 pub const FLAG_CODE: u32 = 1 << 0;
 pub const FLAG_DATA: u32 = 1 << 1;
@@ -55,12 +90,12 @@ pub const FLAG_DISPLAY: u32 = 1 << 6;
 pub struct ManifestHeader {
     pub magic: [u8; 8],
     pub version: U32,
-    pub entry_count: U32,
+    pub compression: U32,
+    pub uncompressed_len: U64,
+    pub compressed_len: U64,
     pub build_id_len: U32,
     pub build_id: [u8; 32],
-    pub reserved: U32,
-    pub strings_off: U64,
-    pub strings_len: U64,
+    pub entry_count: U32,
 }
 
 static_assert!(size_of::<ManifestHeader>() == 72);
@@ -102,8 +137,16 @@ pub struct ManifestInput {
     pub symbols: Vec<ManifestSymbol>,
 }
 
-/// Serialize a manifest. Returns the raw bytes and the deduplicated entry count.
-pub fn build_manifest(input: &ManifestInput) -> Result<(Vec<u8>, usize)> {
+fn build_id_field(input: &ManifestInput) -> ([u8; 32], u32) {
+    let build_id_len = input.build_id.len().min(32);
+    let mut build_id = [0u8; 32];
+    build_id[..build_id_len].copy_from_slice(&input.build_id[..build_id_len]);
+    (build_id, build_id_len as u32)
+}
+
+/// Serialize an uncompressed manifest payload.
+/// Returns the raw payload bytes and the deduplicated entry count.
+pub fn build_manifest_payload(input: &ManifestInput) -> Result<(Vec<u8>, usize)> {
     let mut by_name: BTreeMap<&str, Vec<(u64, u32)>> = BTreeMap::new();
     for sym in &input.symbols {
         let rvas = by_name.entry(&sym.name).or_default();
@@ -174,28 +217,49 @@ pub fn build_manifest(input: &ManifestInput) -> Result<(Vec<u8>, usize)> {
         log::debug!("{dup_names} names have multiple addresses (flagged DUP_NAME)");
     }
 
-    let build_id_len = input.build_id.len().min(32);
-    let mut build_id = [0u8; 32];
-    build_id[..build_id_len].copy_from_slice(&input.build_id[..build_id_len]);
-    let strings_off = size_of::<ManifestHeader>() + entries.len() * size_of::<ManifestEntry>();
-    let header = ManifestHeader {
-        magic: MAGIC,
-        version: U32::new(VERSION),
-        entry_count: U32::new(
-            u32::try_from(entries.len()).ok().context("Entry count exceeds u32")?,
-        ),
-        build_id_len: U32::new(build_id_len as u32),
-        build_id,
-        reserved: U32::new(0),
-        strings_off: U64::new(strings_off as u64),
-        strings_len: U64::new(strings.len() as u64),
-    };
-
+    let strings_off = entries.len() * size_of::<ManifestEntry>();
     let mut out = Vec::with_capacity(strings_off + strings.len());
-    out.extend_from_slice(header.as_bytes());
     out.extend_from_slice(entries.as_slice().as_bytes());
     out.extend_from_slice(&strings);
     Ok((out, entries.len()))
+}
+
+/// Serialize a manifest using the default compression.
+/// Returns the serialized bytes and the deduplicated entry count.
+pub fn build_manifest(input: &ManifestInput) -> Result<(Vec<u8>, usize)> {
+    build_manifest_with_options(input, ManifestOptions::default())
+}
+
+/// Serialize a manifest.
+/// Returns the serialized bytes and the deduplicated entry count.
+pub fn build_manifest_with_options(
+    input: &ManifestInput,
+    options: ManifestOptions,
+) -> Result<(Vec<u8>, usize)> {
+    let (payload, entries) = build_manifest_payload(input)?;
+    let entry_count = u32::try_from(entries).context("Entry count exceeds u32")?;
+    let uncompressed_len = payload.len();
+    let encoded_payload = match options.compression {
+        ManifestCompression::None => payload,
+        ManifestCompression::Zstd => zstd::stream::encode_all(payload.as_slice(), ZSTD_LEVEL)
+            .context("Failed to zstd-compress manifest")?,
+    };
+    let (build_id, build_id_len) = build_id_field(input);
+    let header = ManifestHeader {
+        magic: MAGIC,
+        version: U32::new(VERSION),
+        compression: U32::new(options.compression.code()),
+        uncompressed_len: U64::new(uncompressed_len as u64),
+        compressed_len: U64::new(encoded_payload.len() as u64),
+        build_id_len: U32::new(build_id_len),
+        build_id,
+        entry_count: U32::new(entry_count),
+    };
+
+    let mut out = Vec::with_capacity(size_of::<ManifestHeader>() + encoded_payload.len());
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(&encoded_payload);
+    Ok((out, entries))
 }
 
 #[cfg(test)]
@@ -244,22 +308,13 @@ mod tests {
                 },
             ],
         };
-        let (data, count) = build_manifest(&input).unwrap();
+        let (data, count) = build_manifest_payload(&input).unwrap();
         assert_eq!(count, 8);
 
-        let (header, _) = ManifestHeader::read_from_prefix(&data).unwrap();
-        assert_eq!(header.magic, MAGIC);
-        assert_eq!(header.version.get(), VERSION);
-        assert_eq!(header.entry_count.get(), 8);
-        assert_eq!(header.build_id_len.get(), 20);
-        assert_eq!(header.build_id[..20], [0xAA; 20]);
-        assert_eq!(
-            header.strings_off.get() as usize + header.strings_len.get() as usize,
-            data.len()
-        );
-
+        let strings_off = count * size_of::<ManifestEntry>();
+        assert!(strings_off <= data.len());
         let mut entries = Vec::new();
-        let mut rest = &data[size_of::<ManifestHeader>()..header.strings_off.get() as usize];
+        let mut rest = &data[..strings_off];
         while !rest.is_empty() {
             let (entry, r) = ManifestEntry::read_from_prefix(rest).unwrap();
             entries.push(entry);
@@ -268,7 +323,7 @@ mod tests {
         assert_eq!(entries.len(), 8);
         assert!(entries.is_sorted_by_key(|e| (e.hash.get(), e.name_off.get(), e.rva.get())));
 
-        let strings = &data[header.strings_off.get() as usize..];
+        let strings = &data[strings_off..];
         let find = |name: &str| -> Vec<&ManifestEntry> {
             entries
                 .iter()
@@ -305,5 +360,64 @@ mod tests {
         let over = find("Foo::over");
         assert_eq!(over.len(), 2);
         assert!(over.iter().all(|e| e.flags.get() == FLAG_CODE | FLAG_DISPLAY | FLAG_DUP_NAME));
+    }
+
+    #[test]
+    fn test_build_manifest_v2_zstd() {
+        let input = ManifestInput {
+            build_id: vec![0xBB; 16],
+            symbols: vec![
+                ManifestSymbol { name: "_ZN3Foo3barEv".into(), rva: 0x1000, flags: FLAG_CODE },
+                ManifestSymbol {
+                    name: "Foo::bar".into(),
+                    rva: 0x1000,
+                    flags: FLAG_CODE | FLAG_DISPLAY,
+                },
+            ],
+        };
+
+        let (data, count) = build_manifest(&input).unwrap();
+        assert_eq!(count, 2);
+
+        let (header, compressed) = ManifestHeader::read_from_prefix(&data).unwrap();
+        assert_eq!(header.magic, MAGIC);
+        assert_eq!(header.version.get(), VERSION);
+        assert_eq!(header.compression.get(), ManifestCompression::Zstd.code());
+        assert_eq!(header.build_id_len.get(), 16);
+        assert_eq!(header.build_id[..16], [0xBB; 16]);
+        assert_eq!(header.entry_count.get(), 2);
+        assert_eq!(header.compressed_len.get() as usize, compressed.len());
+
+        let payload = zstd::stream::decode_all(compressed).unwrap();
+        assert_eq!(header.uncompressed_len.get() as usize, payload.len());
+        let strings_off = header.entry_count.get() as usize * size_of::<ManifestEntry>();
+        assert!(strings_off <= payload.len());
+    }
+
+    #[test]
+    fn test_build_manifest_v2_uncompressed() {
+        let input = ManifestInput {
+            build_id: vec![0xCC; 16],
+            symbols: vec![
+                ManifestSymbol { name: "foo".into(), rva: 0x1000, flags: FLAG_CODE },
+                ManifestSymbol { name: "bar".into(), rva: 0x2000, flags: FLAG_DATA },
+            ],
+        };
+
+        let (expected_payload, expected_count) = build_manifest_payload(&input).unwrap();
+        let (data, count) = build_manifest_with_options(&input, ManifestOptions {
+            compression: ManifestCompression::None,
+        })
+        .unwrap();
+        assert_eq!(count, expected_count);
+
+        let (header, payload) = ManifestHeader::read_from_prefix(&data).unwrap();
+        assert_eq!(header.magic, MAGIC);
+        assert_eq!(header.version.get(), VERSION);
+        assert_eq!(header.compression.get(), ManifestCompression::None.code());
+        assert_eq!(header.uncompressed_len.get() as usize, expected_payload.len());
+        assert_eq!(header.compressed_len.get() as usize, expected_payload.len());
+        assert_eq!(header.entry_count.get(), count as u32);
+        assert_eq!(payload, expected_payload.as_slice());
     }
 }

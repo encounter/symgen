@@ -40,16 +40,27 @@ Elsewhere, the linked executable's own symbol table.
 ```shell
 symgen manifest --pdb game.pdb -o game.symdb
 symgen manifest --binary game.elf -o game.symdb
+symgen manifest --binary game.elf -o game.symdb --no-compress
 ```
+
+- `--no-compress`: disables zstd compression
 
 ## Manifest format
 
-Little-endian, designed to be memory-mapped by a mod loader:
+Layout (little-endian):
 
 ```text
-Header  { magic "SYMGEN\0\0", version u32, entry_count u32,
-          build_id_len u32, build_id [u8; 32], reserved u32,
-          strings_off u64, strings_len u64 } (72 bytes; entries 8-aligned)
+Header  { magic "SYMGEN\0\0", version 2 (u32), compression u32,
+           uncompressed_len u64, compressed_len u64,
+           build_id_len u32, build_id [u8; 32], entry_count u32 } (72 bytes)
+Payload  compressed_len bytes, optionally zstd-compressed
+```
+
+`compression` is an enum: `0 = none`, `1 = zstd`.
+
+The decompressed payload contains the entries and string table:
+
+```text
 Entry   { hash u64, rva u64, name_off u32, flags u32 } * entry_count,
           sorted by (hash, name_off) for binary search
 Strings NUL-terminated names, referenced by name_off
@@ -70,6 +81,7 @@ Entry flags:
 | `MULTI_NAME`   | 3   | Multiple names resolve to this RVA (ICF fold or alias)                        |
 | `DUP_NAME`     | 4   | This name maps to multiple RVAs; by-name lookup must treat it as ambiguous    |
 | `INLINE_SITES` | 5   | Inlined into at least one caller; an entry hook misses the inlined calls      |
+| `DISPLAY`      | 6   | Demangled display-name alias generated beside the real symbol name            |
 
 ## License
 
