@@ -44,6 +44,10 @@ pub const FLAG_DUP_NAME: u32 = 1 << 4;
 /// This function was inlined into at least one caller in this build (PDB inlinee
 /// records): an entry hook on it only intercepts the calls that were not inlined.
 pub const FLAG_INLINE_SITES: u32 = 1 << 5;
+/// A demangled display-name alias generated alongside the real (mangled) entry, so
+/// `Class::method` resolves on every platform. Excluded from MULTI_NAME accounting,
+/// and dropped when it collides with a real symbol's name at a different address.
+pub const FLAG_DISPLAY: u32 = 1 << 6;
 
 /// Manifest header.
 #[derive(Clone, Debug, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -105,19 +109,35 @@ pub fn build_manifest(input: &ManifestInput) -> Result<(Vec<u8>, usize)> {
         let rvas = by_name.entry(&sym.name).or_default();
         match rvas.iter_mut().find(|(rva, _)| *rva == sym.rva) {
             Some((_, flags)) => {
+                // A record from any real (non-display, non-local) source clears the
+                // corresponding marker on the merged entry.
                 if sym.flags & FLAG_LOCAL == 0 {
                     *flags &= !FLAG_LOCAL;
                 }
-                *flags |= sym.flags & !FLAG_LOCAL;
+                if sym.flags & FLAG_DISPLAY == 0 {
+                    *flags &= !FLAG_DISPLAY;
+                }
+                *flags |= sym.flags & !(FLAG_LOCAL | FLAG_DISPLAY);
             }
             None => rvas.push((sym.rva, sym.flags)),
         }
     }
 
+    // A display alias that collides with a real symbol's name at a different address
+    // would make that real name ambiguous; the real name wins.
+    for rvas in by_name.values_mut() {
+        if rvas.iter().any(|(_, flags)| flags & FLAG_DISPLAY == 0) {
+            rvas.retain(|(_, flags)| flags & FLAG_DISPLAY == 0);
+        }
+    }
+
     let mut rva_names: BTreeMap<u64, u32> = BTreeMap::new();
     for rvas in by_name.values() {
-        for (rva, _) in rvas {
-            *rva_names.entry(*rva).or_insert(0) += 1;
+        for (rva, flags) in rvas {
+            // Display aliases don't count toward MULTI_NAME
+            if flags & FLAG_DISPLAY == 0 {
+                *rva_names.entry(*rva).or_insert(0) += 1;
+            }
         }
     }
 
@@ -203,15 +223,34 @@ mod tests {
                 ManifestSymbol { name: "dup".into(), rva: 0x4000, flags: FLAG_CODE | FLAG_LOCAL },
                 // Second name at bar's RVA: both flagged MULTI_NAME.
                 ManifestSymbol { name: "bar_alias".into(), rva: 0x2000, flags: FLAG_DATA },
+                // Display alias for foo: resolvable, no MULTI_NAME on either entry.
+                ManifestSymbol {
+                    name: "Foo::foo".into(),
+                    rva: 0x1000,
+                    flags: FLAG_CODE | FLAG_DISPLAY,
+                },
+                // Display alias colliding with the real name "bar" elsewhere: dropped.
+                ManifestSymbol { name: "bar".into(), rva: 0x5000, flags: FLAG_CODE | FLAG_DISPLAY },
+                // Two display aliases at distinct RVAs (overload set): kept, DUP_NAME.
+                ManifestSymbol {
+                    name: "Foo::over".into(),
+                    rva: 0x6000,
+                    flags: FLAG_CODE | FLAG_DISPLAY,
+                },
+                ManifestSymbol {
+                    name: "Foo::over".into(),
+                    rva: 0x7000,
+                    flags: FLAG_CODE | FLAG_DISPLAY,
+                },
             ],
         };
         let (data, count) = build_manifest(&input).unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 8);
 
         let (header, _) = ManifestHeader::read_from_prefix(&data).unwrap();
         assert_eq!(header.magic, MAGIC);
         assert_eq!(header.version.get(), VERSION);
-        assert_eq!(header.entry_count.get(), 5);
+        assert_eq!(header.entry_count.get(), 8);
         assert_eq!(header.build_id_len.get(), 20);
         assert_eq!(header.build_id[..20], [0xAA; 20]);
         assert_eq!(
@@ -226,7 +265,7 @@ mod tests {
             entries.push(entry);
             rest = r;
         }
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 8);
         assert!(entries.is_sorted_by_key(|e| (e.hash.get(), e.name_off.get(), e.rva.get())));
 
         let strings = &data[header.strings_off.get() as usize..];
@@ -252,6 +291,19 @@ mod tests {
 
         let bar = find("bar");
         assert_eq!(bar.len(), 1);
+        assert_eq!(bar[0].rva.get(), 0x2000, "display alias must not displace the real 'bar'");
         assert_eq!(bar[0].flags.get(), FLAG_DATA | FLAG_MULTI_NAME);
+
+        // foo's display alias resolves, and doesn't drag MULTI_NAME onto foo.
+        let foo_display = find("Foo::foo");
+        assert_eq!(foo_display.len(), 1);
+        assert_eq!(foo_display[0].rva.get(), 0x1000);
+        assert_eq!(foo_display[0].flags.get(), FLAG_CODE | FLAG_DISPLAY);
+        assert_eq!(find("foo")[0].flags.get(), FLAG_CODE);
+
+        // Overload set: both display entries kept and marked ambiguous.
+        let over = find("Foo::over");
+        assert_eq!(over.len(), 2);
+        assert!(over.iter().all(|e| e.flags.get() == FLAG_CODE | FLAG_DISPLAY | FLAG_DUP_NAME));
     }
 }

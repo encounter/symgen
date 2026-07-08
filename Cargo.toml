@@ -3,7 +3,7 @@ name = "symgen"
 description = "Symbol exports and link manifest generator for game modding"
 authors = ["Luke Street <luke@street.dev>"]
 license = "MIT OR Apache-2.0"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 publish = false
 repository = "https://github.com/encounter/symgen"
@@ -23,6 +23,7 @@ codegen-units = 1
 [dependencies]
 anyhow = { version = "1.0", features = ["backtrace"] }
 argp = "0.4"
+cpp_demangle = "0.5"
 enable-ansi-support = "0.3"
 log = "0.4"
 object = { version = "0.39", default-features = false, features = ["read", "archive", "coff", "elf", "macho", "std"] }

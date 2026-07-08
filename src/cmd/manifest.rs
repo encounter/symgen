@@ -9,8 +9,8 @@ use argp::FromArgs;
 use pdb::FallibleIterator;
 
 use crate::util::manifest::{
-    FLAG_CODE, FLAG_DATA, FLAG_INLINE_SITES, FLAG_LOCAL, ManifestInput, ManifestSymbol,
-    build_manifest,
+    FLAG_CODE, FLAG_DATA, FLAG_DISPLAY, FLAG_INLINE_SITES, FLAG_LOCAL, ManifestInput,
+    ManifestSymbol, build_manifest,
 };
 
 #[derive(FromArgs, PartialEq, Eq, Debug)]
@@ -69,6 +69,38 @@ fn is_skip_symbol(name: &str) -> bool {
     PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+/// Mangled names whose demangling is not a plain qualified name (vtables, typeinfo,
+/// thunks, guard variables, function-scope statics, Rust v0), so no display alias.
+fn is_special_mangled(name: &str) -> bool {
+    const PREFIXES: &[&str] =
+        &["_ZTV", "_ZTI", "_ZTS", "_ZTh", "_ZTv", "_ZTc", "_ZGV", "_ZGR", "_ZGTt", "_ZZ", "_R"];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// `Class::method`-style display name for an Itanium-mangled symbol: qualified name
+/// only, no parameter list or return type. The PDB path gets the same shape for free
+/// from module procedure records.
+fn display_name(mangled: &str) -> Option<String> {
+    if !mangled.starts_with("_Z") || is_special_mangled(mangled) {
+        return None;
+    }
+    let options = cpp_demangle::DemangleOptions::new().no_params().no_return_type();
+    let display =
+        cpp_demangle::Symbol::new(mangled.as_bytes()).ok()?.demangle_with_options(&options).ok()?;
+    // Rust legacy mangling also parses as Itanium; its hash-suffixed paths are noise.
+    if display.is_empty() || display == mangled || is_rust_legacy(&display) {
+        return None;
+    }
+    Some(display)
+}
+
+fn is_rust_legacy(display: &str) -> bool {
+    display.rfind("::h").is_some_and(|i| {
+        let tail = &display[i + 3..];
+        tail.len() == 16 && tail.bytes().all(|b| b.is_ascii_hexdigit())
+    })
+}
+
 /// Symbols + build id from a linked Mach-O / ELF binary's symtab.
 fn read_binary(path: &Path) -> Result<ManifestInput> {
     use object::{Object, ObjectSymbol};
@@ -89,6 +121,7 @@ fn read_binary(path: &Path) -> Result<ManifestInput> {
         );
     };
 
+    let is_macho = file.format() == object::BinaryFormat::MachO;
     let base = file.relative_address_base();
     let mut symbols = Vec::new();
     for sym in file.symbols() {
@@ -101,17 +134,17 @@ fn read_binary(path: &Path) -> Result<ManifestInput> {
         }
         let flags = match sym.kind() {
             object::SymbolKind::Text => FLAG_CODE,
-            object::SymbolKind::Data => FLAG_DATA,
+            object::SymbolKind::Data | object::SymbolKind::Unknown => FLAG_DATA,
             _ => continue,
         } | if sym.is_local() { FLAG_LOCAL } else { 0 };
-        // dlsym-convention names: strip the Mach-O leading underscore so lookups
+        // dlsym-convention names: strip Mach-O's extra leading underscore so lookups
         // use the same spelling on every platform.
-        let name = name.strip_prefix('_').unwrap_or(name);
-        symbols.push(ManifestSymbol {
-            name: name.to_string(),
-            rva: sym.address().wrapping_sub(base),
-            flags,
-        });
+        let name = if is_macho { name.strip_prefix('_').unwrap_or(name) } else { name };
+        let rva = sym.address().wrapping_sub(base);
+        if let Some(display) = display_name(name) {
+            symbols.push(ManifestSymbol { name: display, rva, flags: flags | FLAG_DISPLAY });
+        }
+        symbols.push(ManifestSymbol { name: name.to_string(), rva, flags });
     }
     Ok(ManifestInput { build_id, symbols })
 }

@@ -67,6 +67,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "cpp_demangle"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0667304c32ea56cb4cd6d2d7c0cfe9a2f8041229db8c033af7f8d69492429def"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "enable-ansi-support"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -320,10 +329,11 @@ dependencies = [
 
 [[package]]
 name = "symgen"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "argp",
+ "cpp_demangle",
  "enable-ansi-support",
  "log",
  "mimalloc",
