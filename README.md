@@ -25,6 +25,10 @@ symgen def --rsp objects.rsp -o game.def
 
 - `--sdk-lib <lib>`: also scan a static library, keeping only unmangled (`extern "C"`) symbols.
   Repeatable.
+- `--forward-dll <dll>`: read a PE DLL's named exports and emit forwarded exports through the
+  generated module (for example, `wgpuFoo=webgpu_dawn.wgpuFoo`). Repeatable.
+- `--forward-sym-prefix <prefix>`: only forward symbols matching one of the supplied prefixes.
+  Repeatable; all named exports are forwarded when omitted.
 - `--include <substr>` / `--exclude <substr>`: filter scanned objects by path substring.
   Repeatable.
 - `--exclude-sym <prefix>`: exclude symbols with the given name prefix. Repeatable.

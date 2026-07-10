@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use argp::FromArgs;
 use object::{
-    Object, ObjectComdat, ObjectSection, ObjectSymbol, SectionIndex, SectionKind, pe,
+    FileKind, Object, ObjectComdat, ObjectSection, ObjectSymbol, SectionIndex, SectionKind, pe,
     read::{
         archive::ArchiveFile,
         coff::{CoffFile, CoffHeader},
@@ -30,6 +30,12 @@ pub struct Args {
     #[argp(option)]
     /// static library to scan for C-only (unmangled) exports; repeatable
     sdk_lib: Vec<PathBuf>,
+    #[argp(option)]
+    /// PE DLL whose named exports should be re-exported as forwarders; repeatable
+    forward_dll: Vec<PathBuf>,
+    #[argp(option)]
+    /// only forward DLL exports with this symbol prefix; repeatable
+    forward_sym_prefix: Vec<String>,
     #[argp(option)]
     /// only scan objects whose path contains this substring; repeatable
     include: Vec<String>,
@@ -191,6 +197,84 @@ fn scan_path(
     }
 }
 
+fn scan_forward_dll(
+    path: &Path,
+    prefixes: &[String],
+    args: &Args,
+    forwarders: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let data = fs::read(path)
+        .with_context(|| format!("Failed to read forward DLL '{}'", path.display()))?;
+    let kind = FileKind::parse(&*data)
+        .with_context(|| format!("Failed to identify forward DLL '{}'", path.display()))?;
+    if !matches!(kind, FileKind::Pe32 | FileKind::Pe64) {
+        bail!("Forward DLL '{}' is not a PE image", path.display());
+    }
+
+    let file = object::File::parse(&*data)
+        .with_context(|| format!("Failed to parse forward DLL '{}'", path.display()))?;
+    let module =
+        path.file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).with_context(|| {
+            format!("Forward DLL has no valid module name: '{}'", path.display())
+        })?;
+
+    for export in file
+        .exports()
+        .with_context(|| format!("Failed to read exports from forward DLL '{}'", path.display()))?
+    {
+        let name = std::str::from_utf8(export.name())
+            .with_context(|| format!("Forward DLL '{}' has a non-UTF-8 export", path.display()))?;
+        if name.is_empty()
+            || (!prefixes.is_empty() && !prefixes.iter().any(|p| name.starts_with(p.as_str())))
+            || is_skip_symbol(name)
+            || args.exclude_sym.iter().any(|p| name.starts_with(p.as_str()))
+        {
+            continue;
+        }
+
+        let target = format!("{module}.{name}");
+        if let Some(existing) = forwarders.get(name) {
+            if existing != &target {
+                bail!("Forward export '{name}' has conflicting targets: {existing} and {target}");
+            }
+        } else {
+            forwarders.insert(name.to_string(), target);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DefExport {
+    Local { data: bool },
+    Forward { target: String },
+}
+
+fn render_def(
+    exports: &BTreeMap<String, bool>,
+    forwarders: &BTreeMap<String, String>,
+) -> Result<String> {
+    let mut combined = BTreeMap::new();
+    for (name, is_data) in exports {
+        combined.insert(name, DefExport::Local { data: *is_data });
+    }
+    for (name, target) in forwarders {
+        if combined.insert(name, DefExport::Forward { target: target.clone() }).is_some() {
+            bail!("Forward export '{name}' conflicts with a local export");
+        }
+    }
+
+    let mut def = String::from("EXPORTS\n");
+    for (name, export) in combined {
+        match export {
+            DefExport::Local { data: true } => def.push_str(&format!("    {name} DATA\n")),
+            DefExport::Local { data: false } => def.push_str(&format!("    {name}\n")),
+            DefExport::Forward { target } => def.push_str(&format!("    {name}={target}\n")),
+        }
+    }
+    Ok(def)
+}
+
 fn path_included(path: &str, includes: &[String], excludes: &[String]) -> bool {
     let p = norm(path);
     if excludes.iter().any(|e| p.contains(e.as_str())) {
@@ -225,28 +309,61 @@ pub fn run(args: Args) -> Result<()> {
     for lib in &args.sdk_lib {
         scan_path(lib, true, &args, &mut exports, &mut stats)?;
     }
-
-    let mut def = String::from("EXPORTS\n");
-    let mut data_count = 0usize;
-    for (name, is_data) in &exports {
-        if *is_data {
-            data_count += 1;
-            def.push_str(&format!("    {name} DATA\n"));
-        } else {
-            def.push_str(&format!("    {name}\n"));
-        }
+    let mut forwarders = BTreeMap::new();
+    for dll in &args.forward_dll {
+        scan_forward_dll(dll, &args.forward_sym_prefix, &args, &mut forwarders)?;
     }
+
+    let def = render_def(&exports, &forwarders)?;
+    let data_count = exports.values().filter(|is_data| **is_data).count();
     fs::write(&args.out, def)
         .with_context(|| format!("Failed to write '{}'", args.out.display()))?;
 
-    log::info!("{} exports ({} data) from {} objects", exports.len(), data_count, stats.objects);
+    let export_count = exports.len() + forwarders.len();
+    log::info!(
+        "{} exports ({} data, {} forwarded) from {} objects",
+        export_count,
+        data_count,
+        forwarders.len(),
+        stats.objects
+    );
     log::debug!("Skipped {} selectany COMDAT symbols", stats.skipped_comdat);
     log::debug!("Skipped {} symbols by name", stats.skipped_name);
     log::debug!("Skipped {} non-C SDK symbols", stats.sdk_skipped_name);
     log::debug!("Skipped {} path-filtered objects", stats.skipped_path);
 
-    if args.max_exports != 0 && exports.len() > args.max_exports {
-        bail!("Export count {} exceeds --max-exports {}", exports.len(), args.max_exports);
+    if args.max_exports != 0 && export_count > args.max_exports {
+        bail!("Export count {} exceeds --max-exports {}", export_count, args.max_exports);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_forwarded_exports_in_name_order() {
+        let exports = BTreeMap::from([
+            ("local_data".to_string(), true),
+            ("local_function".to_string(), false),
+        ]);
+        let forwarders = BTreeMap::from([(
+            "wgpuDeviceCreateBuffer".to_string(),
+            "webgpu_dawn.wgpuDeviceCreateBuffer".to_string(),
+        )]);
+
+        assert_eq!(
+            render_def(&exports, &forwarders).unwrap(),
+            "EXPORTS\n    local_data DATA\n    local_function\n    wgpuDeviceCreateBuffer=webgpu_dawn.wgpuDeviceCreateBuffer\n"
+        );
+    }
+
+    #[test]
+    fn rejects_local_and_forwarded_name_collision() {
+        let exports = BTreeMap::from([("same".to_string(), false)]);
+        let forwarders = BTreeMap::from([("same".to_string(), "provider.same".to_string())]);
+
+        assert!(render_def(&exports, &forwarders).is_err());
+    }
 }
