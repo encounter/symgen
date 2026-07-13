@@ -14,16 +14,17 @@ use object::{
     },
 };
 
+use crate::util::file::process_rsp;
+
 type CoffBigFile<'data> = CoffFile<'data, &'data [u8], pe::AnonObjectHeaderBigobj>;
 
 #[derive(FromArgs, PartialEq, Eq, Debug)]
 /// Generate a curated .def of exportable symbols from built COFF objects.
 #[argp(subcommand, name = "def")]
 pub struct Args {
-    #[argp(option)]
-    /// linker response file listing the objects and archives to scan
-    /// (newline or ';' separated)
-    rsp: PathBuf,
+    #[argp(positional)]
+    /// objects and archives to scan; prefix a response file with @
+    inputs: Vec<String>,
     #[argp(option, short = 'o')]
     /// output .def file
     out: PathBuf,
@@ -290,13 +291,11 @@ pub fn run(args: Args) -> Result<()> {
     let mut exports: BTreeMap<String, bool> = BTreeMap::new();
     let mut stats = Stats::default();
 
-    let rsp = fs::read_to_string(&args.rsp)
-        .with_context(|| format!("Failed to read response file '{}'", args.rsp.display()))?;
-    for line in rsp.lines().flat_map(|l| l.split(';')) {
-        let path = line.trim();
-        if path.is_empty() {
-            continue;
-        }
+    let inputs = process_rsp(&args.inputs)?;
+    if inputs.is_empty() {
+        bail!("At least one input object or archive is required");
+    }
+    for path in &inputs {
         if norm(path).to_lowercase().ends_with(".res") {
             continue; // compiled resources ride along in $<TARGET_OBJECTS>
         }

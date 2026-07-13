@@ -5,23 +5,31 @@
 
 Symbol pipeline tool for moddable game binaries. Built for [Dusklight](https://github.com/TwilitRealm/dusklight).
 
-- `symgen def` scans built COFF objects and archives and writes a curated Windows `.def`,
-  defining the linkable ABI surface for mods on Windows.
-- `symgen manifest` scans the fully linked executable and exports a manifest mapping
-  the hookable symbol surface (including statics) to RVAs, keyed to the exact build.
+- `symgen def` scans COFF objects (and archives) and writes a curated Windows `.def`, defining the linkable exports for
+  mods on Windows.
+- `symgen exports` scans Mach-O/ELF objects (and archives) and writes curated exports that can be used as an input to
+  the linker.
+- `symgen stub` converts exports into a link stub (COFF import library, Mach-O executable, or ELF shared object)
+  for mods to link without the main binary.
+- `symgen manifest` scans the fully linked executable and exports a manifest containing all hookable symbols (including
+  statics).
+- `symgen modmeta` dumps static mod metadata records embedded in native libraries.
 
 ## Commands
 
 ### def
 
-Scans the objects listed in a linker response file and writes a `.def` of exportable symbols.
+Scans COFF objects and archives and writes a `.def` of exportable symbols. Inputs can be
+listed directly or read from a response file by prefixing its path with `@`.
 Compiler and runtime symbols (RTTI descriptors, string literals, initializer thunks, EH data, etc.)
 and selectany COMDAT symbols (duplicated inline functions, templates, vtables) are filtered out
 automatically.
 
 ```shell
-symgen def --rsp objects.rsp -o game.def
+symgen def @objects.rsp -o game.def
 ```
+
+Positional inputs are repeatable. Response files may separate paths with newlines or semicolons.
 
 - `--sdk-lib <lib>`: also scan a static library, keeping only unmangled (`extern "C"`) symbols.
   Repeatable.
@@ -34,6 +42,48 @@ symgen def --rsp objects.rsp -o game.def
 - `--exclude-sym <prefix>`: exclude symbols with the given name prefix. Repeatable.
 - `--max-exports <n>`: fail if the export count exceeds `n` (default 60000; the PE
   hard limit is 65535). `0` to disable.
+
+### exports
+
+The Mach-O/ELF counterpart of `def`: scans objects and archives and writes curated exports for the executable link step.
+Like `def`, prefix response files with `@`.
+
+```shell
+symgen exports @objects.rsp -o game.exp
+symgen exports @objects.rsp -o game.ver --format version-script \
+    --extra-sym JNI_OnLoad --extra-sym 'Java_*'
+```
+
+- `--format <fmt>`: `list` (default) writes one symbol per line for ld64's
+  `-exported_symbols_list`; `version-script` writes an anonymous ELF version script.
+- `--extra-sym <name>`: add a name (or glob) to the output verbatim, bypassing the scan.
+  For symbols that live outside the scanned objects but must stay exported. Repeatable.
+- `--sdk-lib`, `--include`/`--exclude`, `--exclude-sym`: same as `def`
+
+Semantics differ by format: every `-exported_symbols_list` entry becomes an initial undefined
+at link time, so it must exist in the final image and forces extraction of listed archive
+members (matching `.def`). A version script is a filter — names that don't exist are silently
+ignored and force nothing, so unreferenced archive members stay out of the image.
+
+### stub
+
+Converts exports into a link stub that mods can link against instead of the main executable.
+
+```shell
+symgen stub -f implib game.def -o game.lib --dll-name game.exe
+symgen stub -f macho game.exp -o game-stub --min-os 11.0
+symgen stub -f elf libmain.so -o stub.so --soname libmain.so --arch arm64
+```
+
+- `-f implib`: COFF short import library from a `.def`. Imports bind to `--dll-name` (or an explicit `LIBRARY` line);
+  `name=target` forwards import as `name`. `--arch x86_64|arm64`.
+- `-f macho`: stub `MH_EXECUTE` from a symbol list, for linking bundles with `-bundle_loader`. `--arch arm64|x86_64` (
+  repeatable), `--platform macos|ios|tvos`, `--min-os <ver>`.
+- `-f elf`: stub shared object from a symbol list, or directly from a built ELF shared object to mirror its dynamic
+  symbols. `--soname <exe>`, `--arch x86_64|arm64`.
+
+Stub addresses are meaningless: linkers only read names from these files, and they are never
+loaded at runtime.
 
 ### manifest
 
@@ -48,6 +98,18 @@ symgen manifest --binary game.elf -o game.symdb --no-compress
 ```
 
 - `--no-compress`: disables zstd compression
+
+### modmeta
+
+Dumps static mod metadata records (manifest, service imports/exports, hook declarations) from built mod libraries as
+JSON and resolves hook target symbols.
+
+```shell
+symgen modmeta mod.dll mod.so
+symgen modmeta --check mod.dll mod.so
+```
+
+- `--check`: verify that service imports/exports and ABI version must match across a mod's native libraries
 
 ## Manifest format
 
@@ -77,15 +139,15 @@ runtime base.
 
 Entry flags:
 
-| Flag           | Bit | Meaning                                                                       |
-|----------------|-----|-------------------------------------------------------------------------------|
-| `CODE`         | 0   | Function                                                                      |
-| `DATA`         | 1   | Data                                                                          |
-| `LOCAL`        | 2   | Not externally visible in the image: hookable, never linkable                 |
-| `MULTI_NAME`   | 3   | Multiple names resolve to this RVA (ICF fold or alias)                        |
-| `DUP_NAME`     | 4   | This name maps to multiple RVAs; by-name lookup must treat it as ambiguous    |
-| `INLINE_SITES` | 5   | Inlined into at least one caller; an entry hook misses the inlined calls      |
-| `DISPLAY`      | 6   | Demangled display-name alias generated beside the real symbol name            |
+| Flag           | Bit | Meaning                                                                    |
+|----------------|-----|----------------------------------------------------------------------------|
+| `CODE`         | 0   | Function                                                                   |
+| `DATA`         | 1   | Data                                                                       |
+| `LOCAL`        | 2   | Not externally visible in the image: hookable, never linkable              |
+| `MULTI_NAME`   | 3   | Multiple names resolve to this RVA (ICF fold or alias)                     |
+| `DUP_NAME`     | 4   | This name maps to multiple RVAs; by-name lookup must treat it as ambiguous |
+| `INLINE_SITES` | 5   | Inlined into at least one caller; an entry hook misses the inlined calls   |
+| `DISPLAY`      | 6   | Demangled display-name alias generated beside the real symbol name         |
 
 ## License
 

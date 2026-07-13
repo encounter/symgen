@@ -86,8 +86,10 @@ struct TopLevel {
 #[argp(subcommand)]
 enum SubCommand {
     Def(cmd::def::Args),
+    Exports(cmd::exports::Args),
     Manifest(cmd::manifest::Args),
     ModMeta(cmd::modmeta::Args),
+    Stub(cmd::stub::Args),
 }
 
 // Duplicated from supports-color so we can check early.
@@ -143,8 +145,10 @@ fn main() {
     }
     result = result.and_then(|_| match args.command {
         SubCommand::Def(c_args) => cmd::def::run(c_args),
+        SubCommand::Exports(c_args) => cmd::exports::run(c_args),
         SubCommand::Manifest(c_args) => cmd::manifest::run(c_args),
         SubCommand::ModMeta(c_args) => cmd::modmeta::run(c_args),
+        SubCommand::Stub(c_args) => cmd::stub::run(c_args),
     });
     if let Err(e) = result {
         eprintln!("Failed: {e:?}");
