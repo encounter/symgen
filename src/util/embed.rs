@@ -64,8 +64,10 @@ fn no_descriptor(section: &str) -> anyhow::Error {
 fn pe_grow_headers(mut data: Vec<u8>, needed: usize, file_align: u64) -> Result<Vec<u8>> {
     use object::{
         LittleEndian as LE,
-        pe::{IMAGE_DIRECTORY_ENTRY_DEBUG, ImageDataDirectory, ImageDebugDirectory,
-            ImageDosHeader, ImageNtHeaders64, ImageSectionHeader},
+        pe::{
+            IMAGE_DIRECTORY_ENTRY_DEBUG, ImageDataDirectory, ImageDebugDirectory, ImageDosHeader,
+            ImageNtHeaders64, ImageSectionHeader,
+        },
     };
 
     let nt_off = {
@@ -113,8 +115,8 @@ fn pe_grow_headers(mut data: Vec<u8>, needed: usize, file_align: u64) -> Result<
                     rva >= va && rva - va < u64::from(s.size_of_raw_data.get(LE))
                 })
                 .context("Debug directory is not in any section")?;
-            let off = rva - u64::from(section.virtual_address.get(LE)) +
-                u64::from(section.pointer_to_raw_data.get(LE));
+            let off = rva - u64::from(section.virtual_address.get(LE))
+                + u64::from(section.pointer_to_raw_data.get(LE));
             debug_range = Some((
                 off as usize,
                 debug.size.get(LE) as usize / size_of::<ImageDebugDirectory>(),
