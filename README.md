@@ -12,7 +12,7 @@ Symbol pipeline tool for moddable game binaries. Built for [Dusklight](https://g
 - `symgen stub` converts exports into a link stub (COFF import library, Mach-O executable, or ELF shared object)
   for mods to link without the main binary.
 - `symgen manifest` scans the fully linked executable and exports a manifest containing all hookable symbols (including
-  statics).
+  statics), written to a file or embedded into the executable itself.
 - `symgen modmeta` dumps static mod metadata records embedded in native libraries.
 
 ## Commands
@@ -90,11 +90,28 @@ Elsewhere, the linked executable's own symbol table.
 
 ```shell
 symgen manifest --pdb game.pdb -o game.symdb
-symgen manifest --binary game.elf -o game.symdb
 symgen manifest --binary game.elf -o game.symdb --no-compress
+# or, embed directly in an executable:
+symgen manifest --pdb game.pdb --embed game.exe
+symgen manifest --binary libmain.so --embed libmain.so
 ```
 
+- `-o <file>`: write the manifest to a file
+- `--embed <image>`: embed the manifest into an executable (see below)
 - `--no-compress`: disables zstd compression
+
+At least one of `-o` and `--embed` is required.
+
+#### Embedding
+
+A manifest is a post-link artifact, so it cannot be compiled in. Instead, a program may
+reserve a 24-byte descriptor `{ magic "SYMDBHDR" u64, rva u64, size u64 }` in a dedicated
+section (`.symdbh` on PE, `__DATA,__symdbh` on Mach-O, `symdbh` on ELF), and `--embed` appends
+the manifest to the image as a new section and patches the descriptor with its location. No
+relocations are involved: the descriptor's `rva` uses the same convention as manifest RVAs
+(see below), and the runtime reads the manifest at `image base + rva`. The descriptor's
+fields should be declared `volatile` so the compiler cannot fold reads to the zero
+initializer.
 
 ### modmeta
 
