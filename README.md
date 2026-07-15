@@ -121,9 +121,14 @@ JSON and resolves hook target symbols.
 ```shell
 symgen modmeta mod.dll mod.so
 symgen modmeta --check mod.dll mod.so
+symgen modmeta --check --update-json mod.json mod.dll mod.so
 ```
 
-- `--check`: verify that service imports/exports and ABI version must match across a mod's native libraries
+- `--check`: verify well-formedness and that the ABI version and service imports/exports match across a mod's
+  native libraries
+- `--out <file>`: write the JSON dump to a file instead of stdout
+- `--update-json <file>`: verify agreement (as `--check`), then merge the package-level keys (`abi`, `imports`,
+  `exports`) into an existing JSON file such as a mod's `mod.json`, preserving its other keys
 
 ## Manifest format
 

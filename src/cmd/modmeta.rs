@@ -46,6 +46,13 @@ pub struct Args {
     #[argp(switch)]
     /// verify well-formedness and cross-library agreement instead of dumping JSON
     check: bool,
+    #[argp(option)]
+    /// write the JSON dump to a file instead of stdout
+    out: Option<PathBuf>,
+    #[argp(option)]
+    /// verify cross-library agreement, then merge the package-level keys
+    /// (abi, imports, exports) into an existing JSON file (e.g. mod.json)
+    update_json: Option<PathBuf>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -61,14 +68,15 @@ pub fn run(args: Args) -> Result<()> {
         files.push((path, file));
     }
 
-    if args.check {
+    let checked = args.check || args.update_json.is_some();
+    if checked {
         check_agreement(&files)?;
-        println!(
-            "OK: {} librar{} verified",
-            files.len(),
-            if files.len() == 1 { "y" } else { "ies" }
-        );
-    } else {
+    }
+    if let Some(path) = &args.update_json {
+        update_json(path, &files[0].1)
+            .with_context(|| format!("Failed to update '{}'", path.display()))?;
+    }
+    if args.out.is_some() || !checked {
         #[derive(Serialize)]
         struct FileEntry<'a> {
             path: &'a PathBuf,
@@ -81,8 +89,38 @@ pub fn run(args: Args) -> Result<()> {
         }
         let output =
             Output { files: files.iter().map(|(path, meta)| FileEntry { path, meta }).collect() };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        let text = serde_json::to_string_pretty(&output)?;
+        match &args.out {
+            Some(path) => fs::write(path, text + "\n")
+                .with_context(|| format!("Failed to write '{}'", path.display()))?,
+            None => println!("{text}"),
+        }
     }
+    if checked {
+        println!(
+            "OK: {} librar{} verified",
+            files.len(),
+            if files.len() == 1 { "y" } else { "ies" }
+        );
+    }
+    Ok(())
+}
+
+/// Merge the verified package-level metadata into an existing JSON object file, preserving
+/// unrelated keys. Imports and exports agree across libraries (checked above), so the first
+/// library's records are authoritative; hooks are per-binary and excluded.
+fn update_json(path: &PathBuf, meta: &MetaFile) -> Result<()> {
+    let text = fs::read_to_string(path)?;
+    let mut value: serde_json::Value = serde_json::from_str(&text)?;
+    let obj = value.as_object_mut().context("JSON root is not an object")?;
+    let mut imports: Vec<&Import> = meta.imports.iter().collect();
+    imports.sort();
+    let mut exports: Vec<&Export> = meta.exports.iter().collect();
+    exports.sort();
+    obj.insert("abi".to_string(), meta.abi_version.into());
+    obj.insert("imports".to_string(), serde_json::to_value(&imports)?);
+    obj.insert("exports".to_string(), serde_json::to_value(&exports)?);
+    fs::write(path, serde_json::to_string_pretty(&value)? + "\n")?;
     Ok(())
 }
 
