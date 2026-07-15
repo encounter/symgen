@@ -347,9 +347,67 @@ fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     Ok(data)
 }
 
+/// Rebuild a dyld chained fixups blob for one added (fixup-free) segment: seg_count grows,
+/// a zero seg_info_offset entry is inserted at the new segment's index, and everything
+/// after the seg_info_offset array shifts by 8 (the entry plus alignment padding).
+fn grow_chained_fixups(blob: &[u8], insert_index: usize, nsegs: usize) -> Result<Vec<u8>> {
+    let read_u32 = |off: usize| -> Result<u32> {
+        Ok(u32::from_le_bytes(
+            blob.get(off..off + 4).context("Truncated chained fixups")?.try_into().unwrap(),
+        ))
+    };
+    if read_u32(0)? != 0 {
+        bail!("Unknown chained fixups version {}", read_u32(0)?);
+    }
+    let starts_offset = read_u32(4)? as usize;
+    if starts_offset < 28 {
+        bail!("Chained fixups starts_offset {starts_offset:#x} overlaps the header");
+    }
+    let seg_count = read_u32(starts_offset)? as usize;
+    if seg_count != nsegs {
+        bail!("Chained fixups seg_count {seg_count} does not match {nsegs} segments");
+    }
+    if insert_index > seg_count {
+        bail!("Segment index {insert_index} out of range for {seg_count} segments");
+    }
+    let array_end = starts_offset + 4 + 4 * seg_count;
+
+    let mut out = Vec::with_capacity(blob.len() + 8);
+    out.extend_from_slice(blob.get(..starts_offset).context("Truncated chained fixups")?);
+    out.extend_from_slice(&((seg_count + 1) as u32).to_le_bytes());
+    for i in 0..=seg_count {
+        let entry = match i.cmp(&insert_index) {
+            std::cmp::Ordering::Less => read_u32(starts_offset + 4 + 4 * i)?,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => read_u32(starts_offset + 4 + 4 * (i - 1))?,
+        };
+        // seg_info_offset is relative to the starts_in_image struct; nonzero entries point
+        // past the array, which shifts by 8.
+        if entry != 0 && (entry as usize) < 4 + 4 * seg_count {
+            bail!("Chained fixups seg_info_offset {entry:#x} points into the offset array");
+        }
+        out.extend_from_slice(&(if entry != 0 { entry + 8 } else { 0 }).to_le_bytes());
+    }
+    out.extend_from_slice(&[0u8; 4]); // keep the tail's alignment
+    out.extend_from_slice(blob.get(array_end..).context("Truncated chained fixups")?);
+
+    // imports_offset/symbols_offset are relative to the header and land in the shifted tail.
+    for field in [8usize, 12] {
+        let value = read_u32(field)?;
+        if value != 0 {
+            if (value as usize) < array_end {
+                bail!("Chained fixups table offset {value:#x} precedes the segment array");
+            }
+            out[field..field + 4].copy_from_slice(&(value + 8).to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
 /// Mach-O: insert a `__SYMDB` segment where `__LINKEDIT` starts (`__LINKEDIT` must stay the
-/// last segment) and shift every linkedit file offset. Needs load-command headroom (link
-/// with `-headerpad`). Any existing code signature is invalidated; re-sign afterwards.
+/// last segment), shift every linkedit file offset, and grow the chained fixups blob to
+/// cover the added segment. Needs load-command headroom (link with `-headerpad`). Any
+/// existing code signature is invalidated; re-sign afterwards.
 fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     use object::{
         LittleEndian as LE, U32, U64,
@@ -385,9 +443,12 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
 
     // First pass: locate __LINKEDIT, the descriptor section, and the lowest file content,
     // and classify every load command so nothing with a file offset is silently skipped.
-    let mut linkedit: Option<(usize, u64, u64)> = None; // (lc offset, vmaddr, fileoff)
+    let mut linkedit: Option<(usize, u64, u64, u64)> = None; // (lc offset, vmaddr, fileoff, filesize)
+    let mut fixups: Option<(u64, u64)> = None; // (dataoff, datasize)
     let mut desc_off = None;
     let mut min_content = u64::MAX;
+    let mut nsegs = 0usize;
+    let mut symdb_seg_index = 0usize;
     let mut offset = HEADER_SIZE;
     for _ in 0..ncmds {
         let lc = data.get(offset..offset + 8).context("Truncated load commands")?;
@@ -402,13 +463,21 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
                     .map_err(|_| anyhow::anyhow!("Truncated segment command"))?;
                 match &seg.segname {
                     b"__LINKEDIT\0\0\0\0\0\0" => {
-                        linkedit = Some((offset, seg.vmaddr.get(LE), seg.fileoff.get(LE)));
+                        // The new segment's LC is inserted here, so it takes this index.
+                        symdb_seg_index = nsegs;
+                        linkedit = Some((
+                            offset,
+                            seg.vmaddr.get(LE),
+                            seg.fileoff.get(LE),
+                            seg.filesize.get(LE),
+                        ));
                     }
                     b"__SYMDB\0\0\0\0\0\0\0\0\0" => {
                         bail!("Image already has a __SYMDB segment; relink before re-embedding");
                     }
                     _ => {}
                 }
+                nsegs += 1;
                 let nsects = seg.nsects.get(LE) as usize;
                 let sections_off = offset + size_of::<SegmentCommand64<LE>>();
                 let (sections, _) = slice_from_bytes::<Section64<LE>>(
@@ -428,6 +497,16 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
                     }
                 }
             }
+            LC_DYLD_CHAINED_FIXUPS => {
+                let (linkedit_data, _) = from_bytes::<object::macho::LinkeditDataCommand<LE>>(
+                    &data[offset..offset + cmdsize],
+                )
+                .map_err(|_| anyhow::anyhow!("Truncated linkedit data command"))?;
+                fixups = Some((
+                    u64::from(linkedit_data.dataoff.get(LE)),
+                    u64::from(linkedit_data.datasize.get(LE)),
+                ));
+            }
             // Linkedit-relative offsets handled in the second pass.
             LC_SYMTAB
             | LC_DYSYMTAB
@@ -440,7 +519,6 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
             | LC_DYLIB_CODE_SIGN_DRS
             | LC_LINKER_OPTIMIZATION_HINT
             | LC_DYLD_EXPORTS_TRIE
-            | LC_DYLD_CHAINED_FIXUPS
             | LC_ATOM_INFO => {}
             // Known to carry no file offsets.
             LC_UUID
@@ -460,7 +538,8 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
         }
         offset += cmdsize;
     }
-    let (le_off, le_vmaddr, le_fileoff) = linkedit.context("Image has no __LINKEDIT segment")?;
+    let (le_off, le_vmaddr, le_fileoff, le_filesize) =
+        linkedit.context("Image has no __LINKEDIT segment")?;
     let desc_off = desc_off.ok_or_else(|| no_descriptor("__symdbh"))?;
     if le_fileoff % PAGE != 0 {
         bail!("__LINKEDIT is not page-aligned");
@@ -474,11 +553,30 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
 
     let delta = align_up(blob.len() as u64, PAGE);
 
-    // Second pass: shift every nonzero linkedit-relative file offset by delta.
+    // The chained fixups blob records seg_count, which the new segment invalidates (ld
+    // refuses such an image as a -bundle_loader input). Grow the blob by 8 bytes, shifting
+    // the rest of __LINKEDIT behind it.
+    let new_fixups = match fixups {
+        Some((dataoff, datasize)) => {
+            let range = dataoff as usize..(dataoff + datasize) as usize;
+            Some(grow_chained_fixups(
+                data.get(range).context("Chained fixups out of file bounds")?,
+                symdb_seg_index,
+                nsegs,
+            )?)
+        }
+        None => None,
+    };
+    let grow = if new_fixups.is_some() { 8u64 } else { 0 };
+    let fixups_dataoff = fixups.map_or(u64::MAX, |(dataoff, _)| dataoff);
+
+    // Second pass: shift every nonzero linkedit-relative file offset by delta, plus the
+    // fixups growth for content behind the fixups blob.
     let shift = |field: &mut U32<LE>, delta: u64| {
-        let value = field.get(LE);
+        let value = u64::from(field.get(LE));
         if value != 0 {
-            field.set(LE, (u64::from(value) + delta) as u32);
+            let behind_fixups = if value > fixups_dataoff { grow } else { 0 };
+            field.set(LE, (value + delta + behind_fixups) as u32);
         }
     };
     let mut offset = HEADER_SIZE;
@@ -528,6 +626,10 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
                     object::pod::from_bytes_mut::<object::macho::LinkeditDataCommand<LE>>(body)
                         .map_err(|_| anyhow::anyhow!("Truncated linkedit data command"))?;
                 shift(&mut linkedit_data.dataoff, delta);
+                if cmd == LC_DYLD_CHAINED_FIXUPS {
+                    let datasize = linkedit_data.datasize.get(LE);
+                    linkedit_data.datasize.set(LE, datasize + grow as u32);
+                }
             }
             _ => {}
         }
@@ -541,6 +643,9 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
             .map_err(|_| anyhow::anyhow!("Truncated segment command"))?;
         seg.vmaddr.set(LE, le_vmaddr + delta);
         seg.fileoff.set(LE, le_fileoff + delta);
+        seg.filesize.set(LE, le_filesize + grow);
+        let vmsize = seg.vmsize.get(LE).max(align_up(le_filesize + grow, PAGE));
+        seg.vmsize.set(LE, vmsize);
     }
 
     patch_descriptor(&mut data, desc_off, le_vmaddr, blob.len() as u64)?;
@@ -586,11 +691,18 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
         header.sizeofcmds.set(LE, (sizeofcmds + NEW_LC_SIZE) as u32);
     }
 
-    let mut out = Vec::with_capacity(data.len() + delta as usize);
+    let mut out = Vec::with_capacity(data.len() + (delta + grow) as usize);
     out.extend_from_slice(&data[..le_fileoff as usize]);
     out.extend_from_slice(blob);
     out.resize((le_fileoff + delta) as usize, 0);
-    out.extend_from_slice(&data[le_fileoff as usize..]);
+    match (new_fixups, fixups) {
+        (Some(new_fixups), Some((dataoff, datasize))) => {
+            out.extend_from_slice(&data[le_fileoff as usize..dataoff as usize]);
+            out.extend_from_slice(&new_fixups);
+            out.extend_from_slice(&data[(dataoff + datasize) as usize..]);
+        }
+        _ => out.extend_from_slice(&data[le_fileoff as usize..]),
+    }
     log::debug!("Mach-O: __SYMDB at vmaddr {le_vmaddr:#x}, {} bytes", blob.len());
     Ok(out)
 }
