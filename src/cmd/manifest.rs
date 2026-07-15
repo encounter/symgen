@@ -25,7 +25,10 @@ pub struct Args {
     binary: Option<PathBuf>,
     #[argp(option, short = 'o')]
     /// output manifest file
-    out: PathBuf,
+    out: Option<PathBuf>,
+    #[argp(option)]
+    /// linked image to embed the manifest into
+    embed: Option<PathBuf>,
     #[argp(switch)]
     /// disable zstd compression
     no_compress: bool,
@@ -40,8 +43,17 @@ pub fn run(args: Args) -> Result<()> {
     let compression =
         if args.no_compress { ManifestCompression::None } else { ManifestCompression::Zstd };
     let (data, entries) = build_manifest_with_options(&input, ManifestOptions { compression })?;
-    fs::write(&args.out, &data)
-        .with_context(|| format!("Failed to write manifest '{}'", args.out.display()))?;
+    if args.out.is_none() && args.embed.is_none() {
+        bail!("Either --out or --embed is required");
+    }
+    if let Some(out) = &args.out {
+        fs::write(out, &data)
+            .with_context(|| format!("Failed to write manifest '{}'", out.display()))?;
+    }
+    if let Some(image) = &args.embed {
+        crate::util::embed::embed(image, &data)
+            .with_context(|| format!("Failed to embed manifest into '{}'", image.display()))?;
+    }
     log::debug!(
         "Wrote {} entries ({} raw records), {} bytes, {} compression, build id {}",
         entries,
