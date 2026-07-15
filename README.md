@@ -82,9 +82,6 @@ symgen stub -f elf libmain.so -o stub.so --soname libmain.so --arch arm64
 - `-f elf`: stub shared object from a symbol list, or directly from a built ELF shared object to mirror its dynamic
   symbols. `--soname <exe>`, `--arch x86_64|arm64`.
 
-Stub addresses are meaningless: linkers only read names from these files, and they are never
-loaded at runtime.
-
 ### manifest
 
 Maps every hookable symbol in a linked executable to its RVA and writes a symbol manifest.

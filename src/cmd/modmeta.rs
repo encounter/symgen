@@ -258,6 +258,9 @@ fn parse_library(data: &[u8]) -> Result<MetaFile> {
     while off < section_data.len() {
         let rest = &section_data[off..];
         if rest.len() < 8 {
+            if rest.iter().all(|&b| b == 0) {
+                break;
+            }
             bail!("Trailing bytes at section offset {off}");
         }
         if rest[..8] == [0u8; 8] {
