@@ -60,6 +60,101 @@ fn no_descriptor(section: &str) -> anyhow::Error {
     anyhow::anyhow!("Image has no '{section}' descriptor section.")
 }
 
+/// Grow a PE image's header block so the section table can take another entry.
+fn pe_grow_headers(mut data: Vec<u8>, needed: usize, file_align: u64) -> Result<Vec<u8>> {
+    use object::{
+        LittleEndian as LE,
+        pe::{IMAGE_DIRECTORY_ENTRY_DEBUG, ImageDataDirectory, ImageDebugDirectory,
+            ImageDosHeader, ImageNtHeaders64, ImageSectionHeader},
+    };
+
+    let nt_off = {
+        let (dos, _) = from_bytes::<ImageDosHeader>(&data)
+            .map_err(|_| anyhow::anyhow!("Truncated DOS header"))?;
+        dos.e_lfanew.get(LE) as usize
+    };
+    let (nt_bytes, _) = object::pod::from_bytes_mut::<ImageNtHeaders64>(&mut data[nt_off..])
+        .map_err(|_| anyhow::anyhow!("Truncated NT headers"))?;
+    let size_of_headers = nt_bytes.optional_header.size_of_headers.get(LE) as usize;
+    let grow = align_up((needed - size_of_headers) as u64, file_align) as usize;
+    let nsections = nt_bytes.file_header.number_of_sections.get(LE) as usize;
+    let opt_size = nt_bytes.file_header.size_of_optional_header.get(LE) as usize;
+    let ndirs = nt_bytes.optional_header.number_of_rva_and_sizes.get(LE) as usize;
+    nt_bytes.optional_header.size_of_headers.set(LE, (size_of_headers + grow) as u32);
+    let symtab = nt_bytes.file_header.pointer_to_symbol_table.get(LE);
+    if symtab != 0 {
+        nt_bytes.file_header.pointer_to_symbol_table.set(LE, symtab + grow as u32);
+    }
+
+    // The debug directory's entries live in section data and carry file offsets; find them
+    // through the pre-shift section table.
+    let table_off = nt_off + 4 + size_of::<object::pe::ImageFileHeader>() + opt_size;
+    let mut debug_range = None;
+    {
+        let dirs_off = nt_off + size_of::<ImageNtHeaders64>();
+        let (dirs, _) = slice_from_bytes::<ImageDataDirectory>(
+            data.get(dirs_off..).context("Truncated data directories")?,
+            ndirs,
+        )
+        .map_err(|_| anyhow::anyhow!("Truncated data directories"))?;
+        let (sections, _) = slice_from_bytes::<ImageSectionHeader>(
+            data.get(table_off..).context("Truncated section table")?,
+            nsections,
+        )
+        .map_err(|_| anyhow::anyhow!("Truncated section table"))?;
+        if let Some(debug) = dirs.get(IMAGE_DIRECTORY_ENTRY_DEBUG)
+            && debug.size.get(LE) != 0
+        {
+            let rva = u64::from(debug.virtual_address.get(LE));
+            let section = sections
+                .iter()
+                .find(|s| {
+                    let va = u64::from(s.virtual_address.get(LE));
+                    rva >= va && rva - va < u64::from(s.size_of_raw_data.get(LE))
+                })
+                .context("Debug directory is not in any section")?;
+            let off = rva - u64::from(section.virtual_address.get(LE)) +
+                u64::from(section.pointer_to_raw_data.get(LE));
+            debug_range = Some((
+                off as usize,
+                debug.size.get(LE) as usize / size_of::<ImageDebugDirectory>(),
+            ));
+        }
+    }
+    if let Some((off, count)) = debug_range {
+        let (entries, _) = object::pod::slice_from_bytes_mut::<ImageDebugDirectory>(
+            data.get_mut(off..).context("Truncated debug directory")?,
+            count,
+        )
+        .map_err(|_| anyhow::anyhow!("Truncated debug directory"))?;
+        for entry in entries {
+            let pointer = entry.pointer_to_raw_data.get(LE);
+            if pointer != 0 {
+                entry.pointer_to_raw_data.set(LE, pointer + grow as u32);
+            }
+        }
+    }
+
+    let (sections, _) = object::pod::slice_from_bytes_mut::<ImageSectionHeader>(
+        data.get_mut(table_off..).context("Truncated section table")?,
+        nsections,
+    )
+    .map_err(|_| anyhow::anyhow!("Truncated section table"))?;
+    for section in sections {
+        let pointer = section.pointer_to_raw_data.get(LE);
+        if pointer != 0 {
+            section.pointer_to_raw_data.set(LE, pointer + grow as u32);
+        }
+    }
+
+    let mut out = Vec::with_capacity(data.len() + grow);
+    out.extend_from_slice(&data[..size_of_headers]);
+    out.resize(size_of_headers + grow, 0);
+    out.extend_from_slice(&data[size_of_headers..]);
+    log::debug!("PE: grew headers by {grow} bytes for a section table entry");
+    Ok(out)
+}
+
 /// PE: append a `.symdb` section. The new header entry goes in the FileAlignment padding
 /// after the section table; the data is appended at EOF.
 fn pe_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
@@ -131,10 +226,12 @@ fn pe_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     let desc_off = desc_off.ok_or_else(|| no_descriptor(".symdbh"))?;
 
     // Room for one more header entry inside the header block, which must be padding today.
+    // link.exe often sizes the header block exactly; grow it when there is no slack.
     let entry_off = table_off + nsections * size_of::<ImageSectionHeader>();
     let entry_end = entry_off + size_of::<ImageSectionHeader>();
     if entry_end > size_of_headers {
-        bail!("No room for a section header entry ({entry_end} > SizeOfHeaders)");
+        let data = pe_grow_headers(data, entry_end, file_align)?;
+        return pe_embed(data, blob);
     }
     if !data[entry_off..entry_end].iter().all(|&b| b == 0) {
         bail!("Section table is not followed by padding");
@@ -422,7 +519,6 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
         },
     };
 
-    const PAGE: u64 = 0x4000;
     const LC_BUILD_VERSION: u32 = 0x32;
     const LC_ATOM_INFO: u32 = 0x36;
     const HEADER_SIZE: usize = size_of::<MachHeader64<LE>>();
@@ -437,6 +533,10 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     if u32::from_le_bytes(data[0..4].try_into().unwrap()) != MH_MAGIC_64 {
         bail!("Not a little-endian 64-bit Mach-O image");
     }
+    let page: u64 = match header.cputype.get(LE) {
+        object::macho::CPU_TYPE_X86_64 => 0x1000,
+        _ => 0x4000,
+    };
     let ncmds = header.ncmds.get(LE) as usize;
     let sizeofcmds = header.sizeofcmds.get(LE) as usize;
     let cmds_end = HEADER_SIZE + sizeofcmds;
@@ -541,7 +641,7 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     let (le_off, le_vmaddr, le_fileoff, le_filesize) =
         linkedit.context("Image has no __LINKEDIT segment")?;
     let desc_off = desc_off.ok_or_else(|| no_descriptor("__symdbh"))?;
-    if le_fileoff % PAGE != 0 {
+    if le_fileoff % page != 0 {
         bail!("__LINKEDIT is not page-aligned");
     }
     if cmds_end + NEW_LC_SIZE > min_content as usize {
@@ -551,7 +651,7 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
         );
     }
 
-    let delta = align_up(blob.len() as u64, PAGE);
+    let delta = align_up(blob.len() as u64, page);
 
     // The chained fixups blob records seg_count, which the new segment invalidates (ld
     // refuses such an image as a -bundle_loader input). Grow the blob by 8 bytes, shifting
@@ -644,7 +744,7 @@ fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
         seg.vmaddr.set(LE, le_vmaddr + delta);
         seg.fileoff.set(LE, le_fileoff + delta);
         seg.filesize.set(LE, le_filesize + grow);
-        let vmsize = seg.vmsize.get(LE).max(align_up(le_filesize + grow, PAGE));
+        let vmsize = seg.vmsize.get(LE).max(align_up(le_filesize + grow, page));
         seg.vmsize.set(LE, vmsize);
     }
 
