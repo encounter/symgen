@@ -19,12 +19,13 @@ use crate::util::{
     modmeta::{self, HookTarget},
 };
 
-const ARENA_MAGIC: [u8; 8] = *b"PPATARN1";
-const SITE_MAGIC: [u8; 8] = *b"PPATSIT1";
+const ARENA_MAGIC: [u8; 4] = *b"PA01";
+const SITE_MAGIC: [u8; 4] = *b"PS01";
 const CODE_SEGMENT_PREFIX: &[u8; 8] = b"__PPATCH";
 const DATA_SEGMENT_PREFIX: &[u8; 8] = b"__PPDATA";
+// magic[4], capacity[4], record_size[4], reserved[4]
 const ARENA_HEADER_SIZE: u64 = 16;
-const SITE_HEADER_SIZE: u64 = 16;
+const SITE_HEADER_SIZE: u64 = 12;
 const GATEWAY_SIZE: u64 = 28;
 const RECORD_SIZE: u64 = SITE_HEADER_SIZE + GATEWAY_SIZE + 4;
 const PAGE_SIZE: u64 = 0x4000;
@@ -309,10 +310,10 @@ fn make_placement(target: u64, record: u64, slot: u64) -> Result<Placement> {
 
 fn encode_record(target: u64, placement: &Placement) -> Result<[u8; RECORD_SIZE as usize]> {
     let mut record = [0u8; RECORD_SIZE as usize];
-    record[..8].copy_from_slice(&SITE_MAGIC);
-    record[8..12]
+    record[..4].copy_from_slice(&SITE_MAGIC);
+    record[4..8]
         .copy_from_slice(&signed_delta(placement.gateway, target, "Gateway target")?.to_le_bytes());
-    record[12..16].copy_from_slice(
+    record[8..12].copy_from_slice(
         &signed_delta(placement.gateway, placement.slot, "Gateway slot")?.to_le_bytes(),
     );
     for (index, instruction) in placement.instructions.iter().enumerate() {
@@ -369,11 +370,11 @@ fn scan_arenas(
             bail!("Prepatch data arena {generation} does not have exact rw- protections");
         }
         let header = image.bytes_at(code.vmaddr, ARENA_HEADER_SIZE as usize)?;
-        if header[..8] != ARENA_MAGIC {
+        if header[..4] != ARENA_MAGIC {
             bail!("Prepatch arena {generation} has an unsupported header");
         }
-        let capacity = u32::from_le_bytes(header[8..12].try_into().unwrap());
-        let record_size = u32::from_le_bytes(header[12..16].try_into().unwrap());
+        let capacity = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let record_size = u32::from_le_bytes(header[8..12].try_into().unwrap());
         if capacity == 0 || u64::from(record_size) != RECORD_SIZE {
             bail!("Prepatch arena {generation} has an invalid capacity or record size");
         }
@@ -407,7 +408,7 @@ fn scan_arenas(
                 free_indices.push(index);
                 continue;
             }
-            if bytes[..8] != SITE_MAGIC {
+            if bytes[..4] != SITE_MAGIC {
                 bail!("Prepatch record {generation}:{index} has an unsupported header");
             }
             if !slot_bytes.iter().all(|&byte| byte == 0) {
@@ -415,8 +416,8 @@ fn scan_arenas(
             }
             let gateway =
                 record.checked_add(SITE_HEADER_SIZE).context("Gateway address overflows")?;
-            let target_delta = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
-            let slot_delta = i32::from_le_bytes(bytes[12..16].try_into().unwrap());
+            let target_delta = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            let slot_delta = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
             let target = add_delta(gateway, target_delta, "Gateway target address")?;
             let recorded_slot = add_delta(gateway, slot_delta, "Gateway slot address")?;
             if recorded_slot != slot {
@@ -675,9 +676,9 @@ fn apply_prepatch(original: &[u8], image: &MachOImage<'_>, plan: &PrepatchPlan) 
             .context("Arena size overflows")?;
         let slots_size = u64::from(arena.capacity) * 8;
         let mut code = vec![0u8; usize::try_from(code_size).context("Arena exceeds host space")?];
-        code[..8].copy_from_slice(&ARENA_MAGIC);
-        code[8..12].copy_from_slice(&arena.capacity.to_le_bytes());
-        code[12..16].copy_from_slice(&(RECORD_SIZE as u32).to_le_bytes());
+        code[..4].copy_from_slice(&ARENA_MAGIC);
+        code[4..8].copy_from_slice(&arena.capacity.to_le_bytes());
+        code[8..12].copy_from_slice(&(RECORD_SIZE as u32).to_le_bytes());
         for &target in &plan.targets {
             let placement = &plan.placements[&target];
             if placement.record < arena.code_vmaddr || placement.record >= arena.data_vmaddr {
@@ -1008,7 +1009,7 @@ mod tests {
     #[test]
     fn default_arena_fills_one_arm64_page() {
         assert_eq!(ARENA_HEADER_SIZE + u64::from(DEFAULT_ARENA_CAPACITY) * RECORD_SIZE, PAGE_SIZE);
-        assert_eq!(DEFAULT_ARENA_CAPACITY, 341);
+        assert_eq!(DEFAULT_ARENA_CAPACITY, 372);
     }
 
     #[test]
@@ -1017,7 +1018,7 @@ mod tests {
         let (original, resolved, mut report) = many_targets(count);
         let image = parse_image(&original).unwrap();
         let plan = plan_prepatch(&image, &resolved, &mut report).unwrap().unwrap();
-        assert_eq!(plan.new_arena.as_ref().unwrap().capacity, 682);
+        assert_eq!(plan.new_arena.as_ref().unwrap().capacity, 744);
     }
 
     #[test]
