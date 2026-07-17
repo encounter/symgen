@@ -14,7 +14,7 @@ use serde::Serialize;
 use crate::util::{
     arm64,
     file::atomic_replace,
-    macho::{MachOImage, SectionSpec, SegmentSpec, insert_segments},
+    macho::{MachOImage, SectionSpec, SegmentSpec, insert_segments, remove_code_signature},
     manifest::{EmbeddedManifest, FLAG_CODE, LookupError},
     modmeta::{self, HookTarget},
 };
@@ -731,6 +731,8 @@ fn apply_prepatch(original: &[u8], image: &MachOImage<'_>, plan: &PrepatchPlan) 
             .copy_from_slice(&arm64::b(target, plan.placements[&target].gateway)?.to_le_bytes());
     }
 
+    output = remove_code_signature(output)?;
+
     let reparsed = parse_image(&output).context("Transformed Mach-O failed structural reparse")?;
     scan_arenas(&reparsed).context("Transformed Mach-O has invalid prepatch arenas")?;
     EmbeddedManifest::parse_macho(&output)
@@ -846,13 +848,14 @@ mod tests {
     fn base_image() -> Vec<u8> {
         let command_size = 2 * size_of::<macho::SegmentCommand64<LE>>()
             + size_of::<macho::BuildVersionCommand<LE>>()
-            + size_of::<macho::UuidCommand<LE>>();
+            + size_of::<macho::UuidCommand<LE>>()
+            + size_of::<macho::LinkeditDataCommand<LE>>();
         let header = macho::MachHeader64::<LE> {
             magic: ObjectU32::new(object::BigEndian, macho::MH_CIGAM_64),
             cputype: ObjectU32::new(LE, macho::CPU_TYPE_ARM64),
             cpusubtype: ObjectU32::new(LE, macho::CPU_SUBTYPE_ARM64_ALL),
             filetype: ObjectU32::new(LE, macho::MH_EXECUTE),
-            ncmds: ObjectU32::new(LE, 4),
+            ncmds: ObjectU32::new(LE, 5),
             sizeofcmds: ObjectU32::new(LE, command_size as u32),
             flags: ObjectU32::new(LE, macho::MH_NOUNDEFS | macho::MH_DYLDLINK | macho::MH_PIE),
             reserved: ObjectU32::new(LE, 0),
@@ -880,6 +883,12 @@ mod tests {
             cmdsize: ObjectU32::new(LE, size_of::<macho::UuidCommand<LE>>() as u32),
             uuid: UUID,
         };
+        let signature = macho::LinkeditDataCommand::<LE> {
+            cmd: ObjectU32::new(LE, macho::LC_CODE_SIGNATURE),
+            cmdsize: ObjectU32::new(LE, size_of::<macho::LinkeditDataCommand<LE>>() as u32),
+            dataoff: ObjectU32::new(LE, PAGE_SIZE as u32),
+            datasize: ObjectU32::new(LE, 16),
+        };
 
         let mut data = Vec::new();
         data.extend_from_slice(bytes_of(&header));
@@ -887,12 +896,29 @@ mod tests {
         data.extend_from_slice(bytes_of(&linkedit));
         data.extend_from_slice(bytes_of(&build_version));
         data.extend_from_slice(bytes_of(&uuid));
-        data.resize(PAGE_SIZE as usize + 16, 0);
+        data.extend_from_slice(bytes_of(&signature));
+        data.resize(PAGE_SIZE as usize, 0);
+        data.extend_from_slice(&[0xcc; 16]);
         data[TARGET as usize - BASE as usize..TARGET as usize - BASE as usize + 4]
             .copy_from_slice(&arm64::nop().to_le_bytes());
         data[TARGET_2 as usize - BASE as usize..TARGET_2 as usize - BASE as usize + 4]
             .copy_from_slice(&arm64::nop().to_le_bytes());
         data
+    }
+
+    fn has_code_signature(data: &[u8]) -> bool {
+        let (header, _) = object::pod::from_bytes::<macho::MachHeader64<LE>>(data).unwrap();
+        let mut offset = size_of::<macho::MachHeader64<LE>>();
+        for _ in 0..header.ncmds.get(LE) {
+            let cmd = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            let cmdsize =
+                u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+            if cmd == macho::LC_CODE_SIGNATURE {
+                return true;
+            }
+            offset += cmdsize;
+        }
+        false
     }
 
     fn fixture() -> Vec<u8> {
@@ -964,6 +990,7 @@ mod tests {
     #[test]
     fn arenas_are_additive_and_idempotent() {
         let original = fixture();
+        assert!(has_code_signature(&original));
         let image = parse_image(&original).unwrap();
         let mut first_report = report("game_func");
         let first_resolved =
@@ -974,6 +1001,7 @@ mod tests {
         assert_eq!(plan.new_arena.as_ref().unwrap().capacity, DEFAULT_ARENA_CAPACITY);
         assert_eq!(first_report.declarations[0].patch_status, Some("added"));
         let first_output = apply_prepatch(&original, &image, &plan).unwrap();
+        assert!(!has_code_signature(&first_output));
 
         let first_image = parse_image(&first_output).unwrap();
         let (arenas, sites, _) = scan_arenas(&first_image).unwrap();

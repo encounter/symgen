@@ -448,7 +448,7 @@ fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
 /// Mach-O: insert a `__SYMDB` segment where `__LINKEDIT` starts (`__LINKEDIT` must stay the
 /// last segment), shift every linkedit file offset, and grow the chained fixups blob to
 /// cover the added segment. Needs load-command headroom (link with `-headerpad`). Any
-/// existing code signature is invalidated; re-sign afterwards.
+/// existing code signature is removed; re-sign afterwards.
 fn macho_embed(data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     let descriptor_offset = {
         let file = object::File::parse(&*data).context("Failed to parse Mach-O image")?;
@@ -482,5 +482,5 @@ fn macho_embed(data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
         inserted.segments[0].vmaddr,
         blob.len() as u64,
     )?;
-    Ok(output)
+    crate::util::macho::remove_code_signature(output)
 }

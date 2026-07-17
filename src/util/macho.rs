@@ -564,6 +564,133 @@ fn fixed_name(name: &str) -> Result<[u8; 16]> {
     Ok(result)
 }
 
+/// Remove a trailing embedded code signature from a thin 64-bit Mach-O image.
+pub fn remove_code_signature(mut data: Vec<u8>) -> Result<Vec<u8>> {
+    use object::{
+        macho::{LC_CODE_SIGNATURE, LC_SEGMENT_64, MH_MAGIC_64, MachHeader64, SegmentCommand64},
+        pod::{from_bytes, from_bytes_mut},
+    };
+
+    const HEADER_SIZE: usize = size_of::<MachHeader64<LE>>();
+
+    let header = {
+        let (header, _) = from_bytes::<MachHeader64<LE>>(&data)
+            .map_err(|_| anyhow::anyhow!("Truncated Mach-O header"))?;
+        *header
+    };
+    if data.len() < 4 || u32::from_le_bytes(data[..4].try_into().unwrap()) != MH_MAGIC_64 {
+        bail!("Not a little-endian 64-bit Mach-O image");
+    }
+    let ncmds = header.ncmds.get(LE) as usize;
+    let sizeofcmds = header.sizeofcmds.get(LE) as usize;
+    let cmds_end =
+        HEADER_SIZE.checked_add(sizeofcmds).context("Mach-O load-command size overflows")?;
+    if cmds_end > data.len() {
+        bail!("Mach-O load commands extend past the end of the file");
+    }
+
+    let mut linkedit = None; // command offset, fileoff, filesize
+    let mut signature = None; // command offset, command size, dataoff, datasize
+    let mut offset = HEADER_SIZE;
+    for _ in 0..ncmds {
+        let lc = data.get(offset..offset + 8).context("Truncated Mach-O load commands")?;
+        let cmd = u32::from_le_bytes(lc[..4].try_into().unwrap());
+        let cmdsize = u32::from_le_bytes(lc[4..8].try_into().unwrap()) as usize;
+        if cmdsize < 8 || offset + cmdsize > cmds_end {
+            bail!("Bad Mach-O load command size at {offset:#x}");
+        }
+        match cmd {
+            LC_SEGMENT_64 => {
+                let (segment, _) =
+                    from_bytes::<SegmentCommand64<LE>>(&data[offset..offset + cmdsize])
+                        .map_err(|_| anyhow::anyhow!("Truncated segment command"))?;
+                if &segment.segname == b"__LINKEDIT\0\0\0\0\0\0" {
+                    if linkedit.is_some() {
+                        bail!("Mach-O image has multiple __LINKEDIT segments");
+                    }
+                    linkedit = Some((offset, segment.fileoff.get(LE), segment.filesize.get(LE)));
+                }
+            }
+            LC_CODE_SIGNATURE => {
+                if signature.is_some() {
+                    bail!("Mach-O image has multiple LC_CODE_SIGNATURE commands");
+                }
+                let (command, _) = from_bytes::<object::macho::LinkeditDataCommand<LE>>(
+                    &data[offset..offset + cmdsize],
+                )
+                .map_err(|_| anyhow::anyhow!("Truncated code-signature command"))?;
+                signature = Some((
+                    offset,
+                    cmdsize,
+                    u64::from(command.dataoff.get(LE)),
+                    u64::from(command.datasize.get(LE)),
+                ));
+            }
+            _ => {}
+        }
+        offset += cmdsize;
+    }
+    let Some((signature_command_off, signature_command_size, signature_fileoff, signature_size)) =
+        signature
+    else {
+        return Ok(data);
+    };
+    let (linkedit_command_off, linkedit_fileoff, linkedit_filesize) =
+        linkedit.context("Mach-O image has a code signature but no __LINKEDIT segment")?;
+    if signature_fileoff == 0 || signature_size == 0 {
+        bail!("Mach-O code signature has an empty file range");
+    }
+    let signature_end =
+        signature_fileoff.checked_add(signature_size).context("Code-signature range overflows")?;
+    let linkedit_end =
+        linkedit_fileoff.checked_add(linkedit_filesize).context("__LINKEDIT range overflows")?;
+    if signature_fileoff < linkedit_fileoff || signature_end > linkedit_end {
+        bail!("Mach-O code signature is outside __LINKEDIT");
+    }
+    if signature_end != data.len() as u64 || linkedit_end != data.len() as u64 {
+        bail!("Mach-O code signature is not the final data in __LINKEDIT");
+    }
+
+    let new_linkedit_size = signature_fileoff - linkedit_fileoff;
+    {
+        let (segment, _) = from_bytes_mut::<SegmentCommand64<LE>>(
+            &mut data
+                [linkedit_command_off..linkedit_command_off + size_of::<SegmentCommand64<LE>>()],
+        )
+        .map_err(|_| anyhow::anyhow!("Truncated __LINKEDIT command"))?;
+        segment.filesize.set(LE, new_linkedit_size);
+    }
+
+    data.copy_within(
+        signature_command_off + signature_command_size..cmds_end,
+        signature_command_off,
+    );
+    data[cmds_end - signature_command_size..cmds_end].fill(0);
+    {
+        let (header, _) = from_bytes_mut::<MachHeader64<LE>>(&mut data)
+            .map_err(|_| anyhow::anyhow!("Truncated Mach-O header"))?;
+        header.ncmds.set(
+            LE,
+            header.ncmds.get(LE).checked_sub(1).context("Mach-O command count underflows")?,
+        );
+        header.sizeofcmds.set(
+            LE,
+            header
+                .sizeofcmds
+                .get(LE)
+                .checked_sub(
+                    u32::try_from(signature_command_size)
+                        .context("Code-signature command size exceeds u32")?,
+                )
+                .context("Mach-O load-command size underflows")?,
+        );
+    }
+    data.truncate(
+        usize::try_from(signature_fileoff).context("Code-signature offset exceeds host space")?,
+    );
+    Ok(data)
+}
+
 fn read_u32(blob: &[u8], off: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(
         blob.get(off..off + 4).context("Truncated chained fixups")?.try_into().unwrap(),
@@ -1110,6 +1237,76 @@ pub fn insert_segments(mut data: Vec<u8>, specs: &[SegmentSpec]) -> Result<Inser
 mod tests {
     use super::*;
 
+    const TEST_PAGE: u64 = 0x4000;
+
+    fn segment_command(
+        name: &[u8],
+        vmaddr: u64,
+        fileoff: u64,
+        filesize: u64,
+        protection: u32,
+    ) -> macho::SegmentCommand64<LE> {
+        let mut segname = [0u8; 16];
+        segname[..name.len()].copy_from_slice(name);
+        macho::SegmentCommand64 {
+            cmd: U32::new(LE, macho::LC_SEGMENT_64),
+            cmdsize: U32::new(LE, size_of::<macho::SegmentCommand64<LE>>() as u32),
+            segname,
+            vmaddr: U64::new(LE, vmaddr),
+            vmsize: U64::new(LE, TEST_PAGE),
+            fileoff: U64::new(LE, fileoff),
+            filesize: U64::new(LE, filesize),
+            maxprot: U32::new(LE, protection),
+            initprot: U32::new(LE, protection),
+            nsects: U32::new(LE, 0),
+            flags: U32::new(LE, 0),
+        }
+    }
+
+    fn signed_image() -> Vec<u8> {
+        let command_size = 2 * size_of::<macho::SegmentCommand64<LE>>()
+            + size_of::<macho::LinkeditDataCommand<LE>>();
+        let header = macho::MachHeader64::<LE> {
+            magic: U32::new(object::BigEndian, macho::MH_CIGAM_64),
+            cputype: U32::new(LE, macho::CPU_TYPE_ARM64),
+            cpusubtype: U32::new(LE, macho::CPU_SUBTYPE_ARM64_ALL),
+            filetype: U32::new(LE, macho::MH_EXECUTE),
+            ncmds: U32::new(LE, 3),
+            sizeofcmds: U32::new(LE, command_size as u32),
+            flags: U32::new(LE, macho::MH_NOUNDEFS | macho::MH_DYLDLINK | macho::MH_PIE),
+            reserved: U32::new(LE, 0),
+        };
+        let text = segment_command(
+            b"__TEXT",
+            0x1_0000_0000,
+            0,
+            TEST_PAGE,
+            macho::VM_PROT_READ | macho::VM_PROT_EXECUTE,
+        );
+        let linkedit = segment_command(
+            b"__LINKEDIT",
+            0x1_0000_0000 + TEST_PAGE,
+            TEST_PAGE,
+            32,
+            macho::VM_PROT_READ,
+        );
+        let signature = macho::LinkeditDataCommand::<LE> {
+            cmd: U32::new(LE, macho::LC_CODE_SIGNATURE),
+            cmdsize: U32::new(LE, size_of::<macho::LinkeditDataCommand<LE>>() as u32),
+            dataoff: U32::new(LE, TEST_PAGE as u32 + 16),
+            datasize: U32::new(LE, 16),
+        };
+
+        let mut data = Vec::new();
+        data.extend_from_slice(bytes_of(&header));
+        data.extend_from_slice(bytes_of(&text));
+        data.extend_from_slice(bytes_of(&linkedit));
+        data.extend_from_slice(bytes_of(&signature));
+        data.resize(TEST_PAGE as usize + 16, 0xaa);
+        data.extend_from_slice(&[0xbb; 16]);
+        data
+    }
+
     fn test_segment() -> Segment {
         Segment {
             vmaddr: 0x1_0000_0000,
@@ -1137,6 +1334,44 @@ mod tests {
             location: 0x1_0000_0028,
             target: FixupTarget::Bind(Some("game".to_string())),
         }]);
+    }
+
+    #[test]
+    fn removes_trailing_code_signature() {
+        let output = remove_code_signature(signed_image()).unwrap();
+        assert_eq!(output.len(), TEST_PAGE as usize + 16);
+
+        let (header, _) = object::pod::from_bytes::<macho::MachHeader64<LE>>(&output).unwrap();
+        assert_eq!(header.ncmds.get(LE), 2);
+        assert_eq!(
+            header.sizeofcmds.get(LE) as usize,
+            2 * size_of::<macho::SegmentCommand64<LE>>()
+        );
+
+        let linkedit_offset =
+            size_of::<macho::MachHeader64<LE>>() + size_of::<macho::SegmentCommand64<LE>>();
+        let (linkedit, _) =
+            object::pod::from_bytes::<macho::SegmentCommand64<LE>>(&output[linkedit_offset..])
+                .unwrap();
+        assert_eq!(linkedit.filesize.get(LE), 16);
+        assert!(
+            output[size_of::<macho::MachHeader64<LE>>()
+                + 2 * size_of::<macho::SegmentCommand64<LE>>()
+                ..size_of::<macho::MachHeader64<LE>>()
+                    + 2 * size_of::<macho::SegmentCommand64<LE>>()
+                    + size_of::<macho::LinkeditDataCommand<LE>>()]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+
+        assert_eq!(remove_code_signature(output.clone()).unwrap(), output);
+    }
+
+    #[test]
+    fn rejects_code_signature_before_end_of_file() {
+        let mut input = signed_image();
+        input.push(0);
+        assert!(remove_code_signature(input).is_err());
     }
 
     #[test]

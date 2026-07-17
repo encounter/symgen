@@ -144,7 +144,7 @@ symgen prepatch --binary Game.app/Game --report prepatch.json --check mod-a.so m
 ```
 
 `--check` performs the complete audit without modifying the executable. An input set with no hook declarations is a
-successful no-op. The operation invalidates any existing code signature.
+successful no-op. The operation removes any existing code signature.
 
 ## Manifest format
 
