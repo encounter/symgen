@@ -14,7 +14,7 @@
 //! HookName   { record, resolved, name\0 }
 //! ```
 
-use std::mem::size_of;
+use std::{mem::size_of, path::Path};
 
 use anyhow::{Context, Result, bail};
 use object::{Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationTarget};
@@ -24,12 +24,9 @@ use zerocopy::{
     little_endian::{U16, U32, U64},
 };
 
-use crate::{
-    static_assert,
-    util::{
-        macho::MachOImage,
-        msvc::{MemberPointerDecoder, MemberTarget},
-    },
+use super::{
+    macho::MachOImage,
+    msvc::{MemberPointerDecoder, MemberTarget},
 };
 
 const KIND_PAD: u8 = 0;
@@ -114,32 +111,35 @@ struct HookNameRecord {
     resolved: U64,
 }
 
-static_assert!(size_of::<RecordHeader>() == 4);
-static_assert!(size_of::<HeaderRecord>() == 8);
-static_assert!(size_of::<ImportRecord>() == 80);
-static_assert!(size_of::<ExportRecord>() == 80);
-static_assert!(size_of::<HookFnRecord>() == 24);
-static_assert!(size_of::<HookMemRecord>() == 32);
-static_assert!(size_of::<HookMemExtRecord>() == 24);
-static_assert!(size_of::<HookNameRecord>() == 16);
+crate::static_assert!(size_of::<RecordHeader>() == 4);
+crate::static_assert!(size_of::<HeaderRecord>() == 8);
+crate::static_assert!(size_of::<ImportRecord>() == 80);
+crate::static_assert!(size_of::<ExportRecord>() == 80);
+crate::static_assert!(size_of::<HookFnRecord>() == 24);
+crate::static_assert!(size_of::<HookMemRecord>() == 32);
+crate::static_assert!(size_of::<HookMemExtRecord>() == 24);
+crate::static_assert!(size_of::<HookNameRecord>() == 16);
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub(crate) struct Import {
-    service_id: String,
-    major: u16,
-    min_minor: u16,
-    optional: bool,
+/// One static service import declared by a mod entry library.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct Import {
+    pub service_id: String,
+    pub major: u16,
+    pub min_minor: u16,
+    pub optional: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub(crate) struct Export {
-    service_id: String,
-    major: u16,
-    minor: u16,
-    deferred: bool,
+/// One static service export declared by a mod entry library.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct Export {
+    pub service_id: String,
+    pub major: u16,
+    pub minor: u16,
+    pub deferred: bool,
 }
 
-#[derive(Debug, Serialize)]
+/// A decoded static hook target.
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HookTarget {
     Fn {
@@ -157,13 +157,14 @@ pub enum HookTarget {
     },
 }
 
-#[derive(Debug, Serialize)]
+/// Parsed object identity and static mod metadata from one entry library.
+#[derive(Clone, Debug, Serialize)]
 pub struct MetaFile {
-    pub(crate) format: String,
-    pub(crate) arch: String,
-    pub(crate) abi_version: u32,
-    pub(crate) imports: Vec<Import>,
-    pub(crate) exports: Vec<Export>,
+    pub format: String,
+    pub arch: String,
+    pub abi_version: u32,
+    pub imports: Vec<Import>,
+    pub exports: Vec<Export>,
     pub hooks: Vec<HookTarget>,
 }
 
@@ -180,6 +181,9 @@ impl Fixups {
     }
 }
 
+/// Parse the static mod metadata embedded in one native entry library.
+///
+/// This reads object-file structures only; it never loads or executes the library.
 pub fn parse_library(data: &[u8]) -> Result<MetaFile> {
     let file = object::File::parse(data)?;
     let section = file
@@ -227,14 +231,16 @@ pub fn parse_library(data: &[u8]) -> Result<MetaFile> {
         let record_data = &rest[..size];
         let field_addr = |field_offset: usize| section_addr + offset as u64 + field_offset as u64;
         match header.kind {
-            KIND_PAD => {}
+            KIND_PAD => check_flags(&header, 0, offset)?,
             KIND_HEADER => {
+                check_flags(&header, 0, offset)?;
                 let (record, _) = HeaderRecord::read_from_prefix(record_data)
                     .map_err(|_| truncated_record(offset))?;
                 header_count += 1;
                 meta.abi_version = record.abi_version.get();
             }
             KIND_IMPORT => {
+                check_flags(&header, IMPORT_OPTIONAL, offset)?;
                 let (record, _) = ImportRecord::read_from_prefix(record_data)
                     .map_err(|_| truncated_record(offset))?;
                 meta.imports.push(Import {
@@ -245,6 +251,7 @@ pub fn parse_library(data: &[u8]) -> Result<MetaFile> {
                 });
             }
             KIND_EXPORT => {
+                check_flags(&header, EXPORT_DEFERRED, offset)?;
                 let (record, _) = ExportRecord::read_from_prefix(record_data)
                     .map_err(|_| truncated_record(offset))?;
                 meta.exports.push(Export {
@@ -255,6 +262,7 @@ pub fn parse_library(data: &[u8]) -> Result<MetaFile> {
                 });
             }
             KIND_HOOK_FN => {
+                check_flags(&header, 0, offset)?;
                 HookFnRecord::read_from_prefix(record_data)
                     .map_err(|_| truncated_record(offset))?;
                 meta.hooks.push(HookTarget::Fn {
@@ -262,6 +270,7 @@ pub fn parse_library(data: &[u8]) -> Result<MetaFile> {
                 });
             }
             KIND_HOOK_MEM => {
+                check_flags(&header, 0, offset)?;
                 let (record, strings) = HookMemRecord::read_from_prefix(record_data)
                     .map_err(|_| truncated_record(offset))?;
                 let (vtable, rest) = read_cstr(strings, offset)?;
@@ -276,6 +285,7 @@ pub fn parse_library(data: &[u8]) -> Result<MetaFile> {
                 meta.hooks.push(HookTarget::Mem { vtable, display, symbol, virtual_slot });
             }
             KIND_HOOK_MEM_EXT => {
+                check_flags(&header, 0, offset)?;
                 let (record, strings) = HookMemExtRecord::read_from_prefix(record_data)
                     .map_err(|_| truncated_record(offset))?;
                 let pmf_size = record.pmf_size.get();
@@ -293,6 +303,7 @@ pub fn parse_library(data: &[u8]) -> Result<MetaFile> {
                 meta.hooks.push(HookTarget::Mem { vtable, display, symbol, virtual_slot });
             }
             KIND_HOOK_NAME => {
+                check_flags(&header, 0, offset)?;
                 let (_, name) = HookNameRecord::read_from_prefix(record_data)
                     .map_err(|_| truncated_record(offset))?;
                 let (name, _) = read_cstr(name, offset)?;
@@ -309,6 +320,51 @@ pub fn parse_library(data: &[u8]) -> Result<MetaFile> {
     Ok(meta)
 }
 
+/// Verify the ABI and service-set agreement required across a package's entry libraries.
+pub fn check_agreement<T: AsRef<Path>>(files: &[(T, MetaFile)]) -> Result<()> {
+    let Some((first_path, first)) = files.first() else {
+        bail!("At least one mod metadata file is required");
+    };
+    let mut first_imports: Vec<_> = first.imports.iter().collect();
+    let mut first_exports: Vec<_> = first.exports.iter().collect();
+    first_imports.sort_unstable();
+    first_exports.sort_unstable();
+    for (path, file) in files.iter().skip(1) {
+        if file.abi_version != first.abi_version {
+            bail!(
+                "ABI version mismatch: '{}' has v{}, '{}' has v{}",
+                first_path.as_ref().display(),
+                first.abi_version,
+                path.as_ref().display(),
+                file.abi_version
+            );
+        }
+        let mut imports: Vec<_> = file.imports.iter().collect();
+        let mut exports: Vec<_> = file.exports.iter().collect();
+        imports.sort_unstable();
+        exports.sort_unstable();
+        if imports != first_imports || exports != first_exports {
+            bail!(
+                "Service import/export disagreement between '{}' and '{}'",
+                first_path.as_ref().display(),
+                path.as_ref().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn check_flags(header: &RecordHeader, allowed: u8, offset: usize) -> Result<()> {
+    let unknown = header.flags & !allowed;
+    if unknown != 0 {
+        bail!(
+            "Unsupported flags {unknown:#04x} for metadata record kind {} at section offset {offset}",
+            header.kind
+        );
+    }
+    Ok(())
+}
+
 fn truncated_record(offset: usize) -> anyhow::Error {
     anyhow::anyhow!("Truncated record at section offset {offset}")
 }
@@ -320,14 +376,18 @@ fn read_service_id(buffer: &[u8; 64], offset: usize) -> Result<String> {
     if length == 0 {
         bail!("Empty service id at section offset {offset}");
     }
-    Ok(String::from_utf8_lossy(&buffer[..length]).into_owned())
+    let value = std::str::from_utf8(&buffer[..length])
+        .with_context(|| format!("Invalid UTF-8 service id at section offset {offset}"))?;
+    Ok(value.to_owned())
 }
 
 fn read_cstr(buffer: &[u8], offset: usize) -> Result<(String, &[u8])> {
     let Some(length) = buffer.iter().position(|&byte| byte == 0) else {
         bail!("Unterminated string at section offset {offset}");
     };
-    Ok((String::from_utf8_lossy(&buffer[..length]).into_owned(), &buffer[length + 1..]))
+    let value = std::str::from_utf8(&buffer[..length])
+        .with_context(|| format!("Invalid UTF-8 string at section offset {offset}"))?;
+    Ok((value.to_owned(), &buffer[length + 1..]))
 }
 
 fn decode_virtual_slot(
@@ -385,9 +445,50 @@ fn collect_fixups(
 mod tests {
     use super::*;
 
+    fn metadata(abi_version: u32, service_id: &str) -> MetaFile {
+        MetaFile {
+            format: "elf".into(),
+            arch: "aarch64".into(),
+            abi_version,
+            imports: vec![Import {
+                service_id: service_id.into(),
+                major: 1,
+                min_minor: 0,
+                optional: false,
+            }],
+            exports: Vec::new(),
+            hooks: Vec::new(),
+        }
+    }
+
     #[test]
     fn rejects_missing_metadata_section() {
         let error = parse_library(b"not an object").unwrap_err();
         assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_strings_and_unknown_flags() {
+        let mut service_id = [0u8; 64];
+        service_id[0] = 0xff;
+        assert!(read_service_id(&service_id, 8).is_err());
+
+        let header = RecordHeader { size: U16::new(8), kind: KIND_HEADER, flags: 0x80 };
+        assert!(check_flags(&header, 0, 0).is_err());
+    }
+
+    #[test]
+    fn verifies_cross_library_agreement() {
+        let matching = vec![
+            ("linux-aarch64", metadata(1, "dev.example.service")),
+            ("windows-arm64", metadata(1, "dev.example.service")),
+        ];
+        check_agreement(&matching).unwrap();
+
+        let mismatched = vec![
+            ("linux-aarch64", metadata(1, "dev.example.service")),
+            ("windows-arm64", metadata(2, "dev.example.service")),
+        ];
+        assert!(check_agreement(&mismatched).is_err());
     }
 }

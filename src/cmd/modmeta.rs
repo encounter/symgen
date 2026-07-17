@@ -1,7 +1,6 @@
 //! CLI for dumping and validating native mod metadata.
 
 use std::{
-    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -9,8 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use argp::FromArgs;
 use serde::Serialize;
-
-use crate::util::modmeta::{MetaFile, parse_library};
+use symgen::{MetaFile, check_agreement, parse_library};
 
 #[derive(FromArgs, PartialEq, Eq, Debug)]
 /// Dump or verify mod metadata records from native mod libraries.
@@ -100,34 +98,5 @@ fn update_json(path: &Path, meta: &MetaFile) -> Result<()> {
     object.insert("imports".to_string(), serde_json::to_value(&imports)?);
     object.insert("exports".to_string(), serde_json::to_value(&exports)?);
     fs::write(path, serde_json::to_string_pretty(&value)? + "\n")?;
-    Ok(())
-}
-
-fn check_agreement(files: &[(&PathBuf, MetaFile)]) -> Result<()> {
-    let (first_path, first) = &files[0];
-    for (path, file) in files {
-        if file.abi_version != first.abi_version {
-            bail!(
-                "ABI version mismatch: '{}' has v{}, '{}' has v{}",
-                first_path.display(),
-                first.abi_version,
-                path.display(),
-                file.abi_version
-            );
-        }
-        let key = |file: &MetaFile| -> (BTreeSet<String>, BTreeSet<String>) {
-            (
-                file.imports.iter().map(|import| format!("{import:?}")).collect(),
-                file.exports.iter().map(|export| format!("{export:?}")).collect(),
-            )
-        };
-        if key(file) != key(first) {
-            bail!(
-                "Service import/export disagreement between '{}' and '{}'",
-                first_path.display(),
-                path.display()
-            );
-        }
-    }
     Ok(())
 }
