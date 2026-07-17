@@ -89,6 +89,7 @@ enum SubCommand {
     Exports(cmd::exports::Args),
     Manifest(cmd::manifest::Args),
     ModMeta(cmd::modmeta::Args),
+    Prepatch(cmd::prepatch::Args),
     Stub(cmd::stub::Args),
 }
 
@@ -148,6 +149,7 @@ fn main() {
         SubCommand::Exports(c_args) => cmd::exports::run(c_args),
         SubCommand::Manifest(c_args) => cmd::manifest::run(c_args),
         SubCommand::ModMeta(c_args) => cmd::modmeta::run(c_args),
+        SubCommand::Prepatch(c_args) => cmd::prepatch::run(c_args),
         SubCommand::Stub(c_args) => cmd::stub::run(c_args),
     });
     if let Err(e) = result {

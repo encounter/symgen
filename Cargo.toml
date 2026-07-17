@@ -3,7 +3,7 @@ name = "symgen"
 description = "Symbol exports and link manifest generator for game modding"
 authors = ["Luke Street <luke@street.dev>"]
 license = "MIT OR Apache-2.0"
-version = "1.2.4"
+version = "1.3.0"
 edition = "2024"
 publish = false
 repository = "https://github.com/encounter/symgen"
@@ -21,10 +21,13 @@ strip = "debuginfo"
 codegen-units = 1
 
 [dependencies]
+aarchmrs-instructions = { version = "0.4.0-2026-06", default-features = false, features = ["A64"] }
+aarchmrs-types = "0.1.2"
 anyhow = { version = "1.0", features = ["backtrace"] }
 argp = "0.4"
 cpp_demangle = "0.5"
 enable-ansi-support = "0.3"
+iced-x86 = { version = "1.21", default-features = false, features = ["decoder", "std"] }
 implib = { version = "0.6.0", default-features = false, features = ["msvc"] }
 log = "0.4"
 object = { version = "0.39", default-features = false, features = ["read", "archive", "coff", "elf", "macho", "std"] }
@@ -34,6 +37,8 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 supports-color = "3.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+yaxpeax-arch = "0.3"
+yaxpeax-arm = "0.4"
 zerocopy = { version = "0.8", features = ["derive"] }
 zstd = "0.13"
 

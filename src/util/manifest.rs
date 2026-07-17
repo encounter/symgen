@@ -25,7 +25,8 @@
 
 use std::{collections::BTreeMap, mem::size_of};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use object::{Object, ObjectSection};
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout,
     little_endian::{U32, U64},
@@ -135,6 +136,147 @@ pub struct ManifestSymbol {
 pub struct ManifestInput {
     pub build_id: Vec<u8>,
     pub symbols: Vec<ManifestSymbol>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManifestLookup {
+    pub vmaddr: u64,
+    pub flags: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LookupError {
+    NotFound,
+    Ambiguous,
+}
+
+/// Parsed `__SYMDB,__symdb` payload from a Mach-O image. Addresses are the link-time
+/// vmaddrs stored by the writer; no runtime image base or dyld slide is applied here.
+pub struct EmbeddedManifest {
+    payload: Vec<u8>,
+    entry_count: usize,
+    strings_off: usize,
+    pub build_uuid: [u8; 16],
+}
+
+impl EmbeddedManifest {
+    pub fn parse_macho(data: &[u8]) -> Result<Self> {
+        let file = object::File::parse(data).context("Failed to parse Mach-O image")?;
+        if file.format() != object::BinaryFormat::MachO {
+            bail!("Embedded manifests for prepatch require a Mach-O image");
+        }
+        let uuid = file.mach_uuid()?.context("Mach-O image has no LC_UUID")?;
+        let section = file
+            .section_by_name("__symdb")
+            .context("Mach-O image has no __SYMDB,__symdb section")?;
+        let blob = section.data().context("Failed to read __SYMDB,__symdb")?;
+        let (header, stored) = ManifestHeader::read_from_prefix(blob)
+            .map_err(|_| anyhow::anyhow!("Embedded symbol manifest is truncated"))?;
+        if header.magic != MAGIC || header.version.get() != VERSION {
+            bail!("Embedded symbol manifest has wrong magic/version");
+        }
+        if header.build_id_len.get() != 16 || header.build_id[..16] != uuid {
+            bail!("Embedded symbol manifest UUID does not match LC_UUID");
+        }
+        let compressed_len = usize::try_from(header.compressed_len.get())
+            .context("Embedded symbol manifest compressed size is too large")?;
+        let uncompressed_len = usize::try_from(header.uncompressed_len.get())
+            .context("Embedded symbol manifest uncompressed size is too large")?;
+        let stored = stored
+            .get(..compressed_len)
+            .context("Embedded symbol manifest payload is truncated")?;
+        let payload = match header.compression.get() {
+            x if x == ManifestCompression::None.code() => {
+                if compressed_len != uncompressed_len {
+                    bail!("Uncompressed symbol manifest length mismatch");
+                }
+                stored.to_vec()
+            }
+            x if x == ManifestCompression::Zstd.code() => {
+                let payload = zstd::stream::decode_all(stored)
+                    .context("Failed to decompress embedded symbol manifest")?;
+                if payload.len() != uncompressed_len {
+                    bail!(
+                        "Embedded symbol manifest decompressed to {} bytes, expected {}",
+                        payload.len(),
+                        uncompressed_len
+                    );
+                }
+                payload
+            }
+            compression => bail!("Unsupported symbol manifest compression {compression}"),
+        };
+        let entry_count = header.entry_count.get() as usize;
+        let strings_off = entry_count
+            .checked_mul(size_of::<ManifestEntry>())
+            .context("Embedded symbol manifest entry table overflows")?;
+        if strings_off > payload.len() {
+            bail!("Embedded symbol manifest entry table is truncated");
+        }
+
+        let result = Self { payload, entry_count, strings_off, build_uuid: uuid };
+        let mut previous = None;
+        for index in 0..result.entry_count {
+            let entry = result.entry(index)?;
+            let key = (entry.hash.get(), entry.name_off.get(), entry.rva.get());
+            if previous.is_some_and(|p| p > key) {
+                bail!("Embedded symbol manifest entries are not sorted");
+            }
+            previous = Some(key);
+            result.name(entry.name_off.get())?;
+        }
+        Ok(result)
+    }
+
+    fn entry(&self, index: usize) -> Result<ManifestEntry> {
+        let off = index
+            .checked_mul(size_of::<ManifestEntry>())
+            .context("Manifest entry offset overflows")?;
+        ManifestEntry::read_from_prefix(&self.payload[off..self.strings_off])
+            .map(|(entry, _)| entry)
+            .map_err(|_| anyhow::anyhow!("Embedded symbol manifest entry is truncated"))
+    }
+
+    fn name(&self, name_off: u32) -> Result<&str> {
+        let start = self
+            .strings_off
+            .checked_add(name_off as usize)
+            .context("Manifest string offset overflows")?;
+        let rest = self.payload.get(start..).context("Manifest string offset is out of bounds")?;
+        let len = rest.iter().position(|&byte| byte == 0).context("Unterminated manifest name")?;
+        std::str::from_utf8(&rest[..len]).context("Manifest name is not UTF-8")
+    }
+
+    pub fn lookup(&self, name: &str) -> std::result::Result<ManifestLookup, LookupError> {
+        let hash = fnv1a64(name.as_bytes());
+        let mut lo = 0usize;
+        let mut hi = self.entry_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let entry = self.entry(mid).expect("manifest validated during construction");
+            if entry.hash.get() < hash {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        for index in lo..self.entry_count {
+            let entry = self.entry(index).expect("manifest validated during construction");
+            if entry.hash.get() != hash {
+                break;
+            }
+            if self.name(entry.name_off.get()).expect("manifest validated during construction")
+                != name
+            {
+                continue;
+            }
+            if entry.flags.get() & FLAG_DUP_NAME != 0 {
+                return Err(LookupError::Ambiguous);
+            }
+            return Ok(ManifestLookup { vmaddr: entry.rva.get(), flags: entry.flags.get() });
+        }
+        Err(LookupError::NotFound)
+    }
 }
 
 fn build_id_field(input: &ManifestInput) -> ([u8; 32], u32) {
@@ -419,5 +561,33 @@ mod tests {
         assert_eq!(header.compressed_len.get() as usize, expected_payload.len());
         assert_eq!(header.entry_count.get(), count as u32);
         assert_eq!(payload, expected_payload.as_slice());
+    }
+
+    #[test]
+    fn embedded_lookup_matches_complete_names_and_rejects_duplicates() {
+        let input = ManifestInput {
+            build_id: vec![0xDD; 16],
+            symbols: vec![
+                ManifestSymbol { name: "foo".into(), rva: 0x1000, flags: FLAG_CODE },
+                ManifestSymbol { name: "foobar".into(), rva: 0x2000, flags: FLAG_CODE },
+                ManifestSymbol { name: "duplicate".into(), rva: 0x3000, flags: FLAG_CODE },
+                ManifestSymbol { name: "duplicate".into(), rva: 0x4000, flags: FLAG_CODE },
+            ],
+        };
+        let (payload, entry_count) = build_manifest_payload(&input).unwrap();
+        let manifest = EmbeddedManifest {
+            strings_off: entry_count * size_of::<ManifestEntry>(),
+            payload,
+            entry_count,
+            build_uuid: [0xDD; 16],
+        };
+
+        assert_eq!(manifest.lookup("foo"), Ok(ManifestLookup { vmaddr: 0x1000, flags: FLAG_CODE }));
+        assert_eq!(
+            manifest.lookup("foobar"),
+            Ok(ManifestLookup { vmaddr: 0x2000, flags: FLAG_CODE })
+        );
+        assert_eq!(manifest.lookup("fo"), Err(LookupError::NotFound));
+        assert_eq!(manifest.lookup("duplicate"), Err(LookupError::Ambiguous));
     }
 }

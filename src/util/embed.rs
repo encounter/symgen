@@ -9,7 +9,12 @@
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail};
-use object::pod::{bytes_of, from_bytes, slice_from_bytes};
+use object::{
+    Object, ObjectSection,
+    pod::{bytes_of, from_bytes, slice_from_bytes},
+};
+
+use crate::util::file::atomic_replace;
 
 /// "SYMDBHDR", the compile-time value of the descriptor's first field.
 const DESCRIPTOR_MAGIC: u64 = u64::from_le_bytes(*b"SYMDBHDR");
@@ -28,13 +33,7 @@ pub fn embed(path: &Path, blob: &[u8]) -> Result<()> {
         object::FileKind::MachO64 => macho_embed(data, blob)?,
         _ => bail!("Unsupported image format {kind:?} (need 64-bit PE, ELF, or Mach-O)"),
     };
-    let tmp = path.with_extension("embed.tmp");
-    fs::write(&tmp, &out).with_context(|| format!("Failed to write '{}'", tmp.display()))?;
-    let perms = fs::metadata(path)?.permissions();
-    fs::set_permissions(&tmp, perms)?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("Failed to replace image '{}'", path.display()))?;
-    Ok(())
+    atomic_replace(path, &out)
 }
 
 fn align_up(value: u64, align: u64) -> u64 { value.next_multiple_of(align.max(1)) }
@@ -446,365 +445,42 @@ fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Rebuild a dyld chained fixups blob for one added (fixup-free) segment: seg_count grows,
-/// a zero seg_info_offset entry is inserted at the new segment's index, and everything
-/// after the seg_info_offset array shifts by 8 (the entry plus alignment padding).
-fn grow_chained_fixups(blob: &[u8], insert_index: usize, nsegs: usize) -> Result<Vec<u8>> {
-    let read_u32 = |off: usize| -> Result<u32> {
-        Ok(u32::from_le_bytes(
-            blob.get(off..off + 4).context("Truncated chained fixups")?.try_into().unwrap(),
-        ))
-    };
-    if read_u32(0)? != 0 {
-        bail!("Unknown chained fixups version {}", read_u32(0)?);
-    }
-    let starts_offset = read_u32(4)? as usize;
-    if starts_offset < 28 {
-        bail!("Chained fixups starts_offset {starts_offset:#x} overlaps the header");
-    }
-    let seg_count = read_u32(starts_offset)? as usize;
-    if seg_count != nsegs {
-        bail!("Chained fixups seg_count {seg_count} does not match {nsegs} segments");
-    }
-    if insert_index > seg_count {
-        bail!("Segment index {insert_index} out of range for {seg_count} segments");
-    }
-    let array_end = starts_offset + 4 + 4 * seg_count;
-
-    let mut out = Vec::with_capacity(blob.len() + 8);
-    out.extend_from_slice(blob.get(..starts_offset).context("Truncated chained fixups")?);
-    out.extend_from_slice(&((seg_count + 1) as u32).to_le_bytes());
-    for i in 0..=seg_count {
-        let entry = match i.cmp(&insert_index) {
-            std::cmp::Ordering::Less => read_u32(starts_offset + 4 + 4 * i)?,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => read_u32(starts_offset + 4 + 4 * (i - 1))?,
-        };
-        // seg_info_offset is relative to the starts_in_image struct; nonzero entries point
-        // past the array, which shifts by 8.
-        if entry != 0 && (entry as usize) < 4 + 4 * seg_count {
-            bail!("Chained fixups seg_info_offset {entry:#x} points into the offset array");
-        }
-        out.extend_from_slice(&(if entry != 0 { entry + 8 } else { 0 }).to_le_bytes());
-    }
-    out.extend_from_slice(&[0u8; 4]); // keep the tail's alignment
-    out.extend_from_slice(blob.get(array_end..).context("Truncated chained fixups")?);
-
-    // imports_offset/symbols_offset are relative to the header and land in the shifted tail.
-    for field in [8usize, 12] {
-        let value = read_u32(field)?;
-        if value != 0 {
-            if (value as usize) < array_end {
-                bail!("Chained fixups table offset {value:#x} precedes the segment array");
-            }
-            out[field..field + 4].copy_from_slice(&(value + 8).to_le_bytes());
-        }
-    }
-    Ok(out)
-}
-
 /// Mach-O: insert a `__SYMDB` segment where `__LINKEDIT` starts (`__LINKEDIT` must stay the
 /// last segment), shift every linkedit file offset, and grow the chained fixups blob to
 /// cover the added segment. Needs load-command headroom (link with `-headerpad`). Any
 /// existing code signature is invalidated; re-sign afterwards.
-fn macho_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
-    use object::{
-        LittleEndian as LE, U32, U64,
-        macho::{
-            LC_CODE_SIGNATURE, LC_DATA_IN_CODE, LC_DYLD_CHAINED_FIXUPS, LC_DYLD_ENVIRONMENT,
-            LC_DYLD_EXPORTS_TRIE, LC_DYLD_INFO, LC_DYLD_INFO_ONLY, LC_DYLIB_CODE_SIGN_DRS,
-            LC_DYSYMTAB, LC_FUNCTION_STARTS, LC_ID_DYLIB, LC_LINKER_OPTIMIZATION_HINT,
-            LC_LOAD_DYLIB, LC_LOAD_DYLINKER, LC_LOAD_UPWARD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_MAIN,
-            LC_REEXPORT_DYLIB, LC_RPATH, LC_SEGMENT_64, LC_SEGMENT_SPLIT_INFO, LC_SOURCE_VERSION,
-            LC_SYMTAB, LC_UUID, LC_VERSION_MIN_MACOSX, MH_MAGIC_64, MachHeader64, Section64,
-            SegmentCommand64, VM_PROT_READ,
-        },
-    };
-
-    const LC_BUILD_VERSION: u32 = 0x32;
-    const LC_ATOM_INFO: u32 = 0x36;
-    const HEADER_SIZE: usize = size_of::<MachHeader64<LE>>();
-    const NEW_LC_SIZE: usize = size_of::<SegmentCommand64<LE>>() + size_of::<Section64<LE>>();
-
-    let header = {
-        let (header, _) = from_bytes::<MachHeader64<LE>>(&data)
-            .map_err(|_| anyhow::anyhow!("Truncated Mach-O header"))?;
-        *header
-    };
-    // The magic field is declared big-endian in the object crate; check the raw bytes.
-    if u32::from_le_bytes(data[0..4].try_into().unwrap()) != MH_MAGIC_64 {
-        bail!("Not a little-endian 64-bit Mach-O image");
-    }
-    let page: u64 = match header.cputype.get(LE) {
-        object::macho::CPU_TYPE_X86_64 => 0x1000,
-        _ => 0x4000,
-    };
-    let ncmds = header.ncmds.get(LE) as usize;
-    let sizeofcmds = header.sizeofcmds.get(LE) as usize;
-    let cmds_end = HEADER_SIZE + sizeofcmds;
-
-    // First pass: locate __LINKEDIT, the descriptor section, and the lowest file content,
-    // and classify every load command so nothing with a file offset is silently skipped.
-    let mut linkedit: Option<(usize, u64, u64, u64)> = None; // (lc offset, vmaddr, fileoff, filesize)
-    let mut fixups: Option<(u64, u64)> = None; // (dataoff, datasize)
-    let mut desc_off = None;
-    let mut min_content = u64::MAX;
-    let mut nsegs = 0usize;
-    let mut symdb_seg_index = 0usize;
-    let mut offset = HEADER_SIZE;
-    for _ in 0..ncmds {
-        let lc = data.get(offset..offset + 8).context("Truncated load commands")?;
-        let cmd = u32::from_le_bytes(lc[0..4].try_into().unwrap());
-        let cmdsize = u32::from_le_bytes(lc[4..8].try_into().unwrap()) as usize;
-        if cmdsize < 8 || offset + cmdsize > cmds_end {
-            bail!("Bad load command size at {offset:#x}");
+fn macho_embed(data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
+    let descriptor_offset = {
+        let file = object::File::parse(&*data).context("Failed to parse Mach-O image")?;
+        if file.section_by_name("__symdb").is_some() {
+            bail!("Image already has a __SYMDB segment; relink before re-embedding");
         }
-        match cmd {
-            LC_SEGMENT_64 => {
-                let (seg, _) = from_bytes::<SegmentCommand64<LE>>(&data[offset..offset + cmdsize])
-                    .map_err(|_| anyhow::anyhow!("Truncated segment command"))?;
-                match &seg.segname {
-                    b"__LINKEDIT\0\0\0\0\0\0" => {
-                        // The new segment's LC is inserted here, so it takes this index.
-                        symdb_seg_index = nsegs;
-                        linkedit = Some((
-                            offset,
-                            seg.vmaddr.get(LE),
-                            seg.fileoff.get(LE),
-                            seg.filesize.get(LE),
-                        ));
-                    }
-                    b"__SYMDB\0\0\0\0\0\0\0\0\0" => {
-                        bail!("Image already has a __SYMDB segment; relink before re-embedding");
-                    }
-                    _ => {}
-                }
-                nsegs += 1;
-                let nsects = seg.nsects.get(LE) as usize;
-                let sections_off = offset + size_of::<SegmentCommand64<LE>>();
-                let (sections, _) = slice_from_bytes::<Section64<LE>>(
-                    data.get(sections_off..).context("Truncated section commands")?,
-                    nsects,
-                )
-                .map_err(|_| anyhow::anyhow!("Truncated section commands"))?;
-                for section in sections {
-                    if &section.sectname == b"__symdbh\0\0\0\0\0\0\0\0" {
-                        if section.size.get(LE) < DESCRIPTOR_SIZE as u64 {
-                            bail!("Descriptor section __symdbh is too small");
-                        }
-                        desc_off = Some(section.offset.get(LE) as usize);
-                    }
-                    if section.offset.get(LE) != 0 {
-                        min_content = min_content.min(u64::from(section.offset.get(LE)));
-                    }
-                }
-            }
-            LC_DYLD_CHAINED_FIXUPS => {
-                let (linkedit_data, _) = from_bytes::<object::macho::LinkeditDataCommand<LE>>(
-                    &data[offset..offset + cmdsize],
-                )
-                .map_err(|_| anyhow::anyhow!("Truncated linkedit data command"))?;
-                fixups = Some((
-                    u64::from(linkedit_data.dataoff.get(LE)),
-                    u64::from(linkedit_data.datasize.get(LE)),
-                ));
-            }
-            // Linkedit-relative offsets handled in the second pass.
-            LC_SYMTAB
-            | LC_DYSYMTAB
-            | LC_DYLD_INFO
-            | LC_DYLD_INFO_ONLY
-            | LC_CODE_SIGNATURE
-            | LC_SEGMENT_SPLIT_INFO
-            | LC_FUNCTION_STARTS
-            | LC_DATA_IN_CODE
-            | LC_DYLIB_CODE_SIGN_DRS
-            | LC_LINKER_OPTIMIZATION_HINT
-            | LC_DYLD_EXPORTS_TRIE
-            | LC_ATOM_INFO => {}
-            // Known to carry no file offsets.
-            LC_UUID
-            | LC_BUILD_VERSION
-            | LC_VERSION_MIN_MACOSX
-            | LC_SOURCE_VERSION
-            | LC_MAIN
-            | LC_LOAD_DYLINKER
-            | LC_DYLD_ENVIRONMENT
-            | LC_ID_DYLIB
-            | LC_LOAD_DYLIB
-            | LC_LOAD_WEAK_DYLIB
-            | LC_REEXPORT_DYLIB
-            | LC_LOAD_UPWARD_DYLIB
-            | LC_RPATH => {}
-            _ => bail!("Unhandled load command {cmd:#x}; refusing to relayout the image"),
+        let section = file.section_by_name("__symdbh").ok_or_else(|| no_descriptor("__symdbh"))?;
+        let (offset, size) = section.file_range().context("Descriptor is not file-backed")?;
+        if size < DESCRIPTOR_SIZE as u64 {
+            bail!("Descriptor section __symdbh is too small");
         }
-        offset += cmdsize;
-    }
-    let (le_off, le_vmaddr, le_fileoff, le_filesize) =
-        linkedit.context("Image has no __LINKEDIT segment")?;
-    let desc_off = desc_off.ok_or_else(|| no_descriptor("__symdbh"))?;
-    if le_fileoff % page != 0 {
-        bail!("__LINKEDIT is not page-aligned");
-    }
-    if cmds_end + NEW_LC_SIZE > min_content as usize {
-        bail!(
-            "No load-command headroom for a segment; link with -Wl,-headerpad,{:#x}",
-            NEW_LC_SIZE
-        );
-    }
-
-    let delta = align_up(blob.len() as u64, page);
-
-    // The chained fixups blob records seg_count, which the new segment invalidates (ld
-    // refuses such an image as a -bundle_loader input). Grow the blob by 8 bytes, shifting
-    // the rest of __LINKEDIT behind it.
-    let new_fixups = match fixups {
-        Some((dataoff, datasize)) => {
-            let range = dataoff as usize..(dataoff + datasize) as usize;
-            Some(grow_chained_fixups(
-                data.get(range).context("Chained fixups out of file bounds")?,
-                symdb_seg_index,
-                nsegs,
-            )?)
-        }
-        None => None,
+        usize::try_from(offset).context("Descriptor file offset is too large")?
     };
-    let grow = if new_fixups.is_some() { 8u64 } else { 0 };
-    let fixups_dataoff = fixups.map_or(u64::MAX, |(dataoff, _)| dataoff);
-
-    // Second pass: shift every nonzero linkedit-relative file offset by delta, plus the
-    // fixups growth for content behind the fixups blob.
-    let shift = |field: &mut U32<LE>, delta: u64| {
-        let value = u64::from(field.get(LE));
-        if value != 0 {
-            let behind_fixups = if value > fixups_dataoff { grow } else { 0 };
-            field.set(LE, (value + delta + behind_fixups) as u32);
-        }
-    };
-    let mut offset = HEADER_SIZE;
-    for _ in 0..ncmds {
-        let cmd = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-        let cmdsize = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
-        let body = &mut data[offset..offset + cmdsize];
-        match cmd {
-            LC_SYMTAB => {
-                let (symtab, _) =
-                    object::pod::from_bytes_mut::<object::macho::SymtabCommand<LE>>(body)
-                        .map_err(|_| anyhow::anyhow!("Truncated symtab command"))?;
-                shift(&mut symtab.symoff, delta);
-                shift(&mut symtab.stroff, delta);
-            }
-            LC_DYSYMTAB => {
-                let (dysymtab, _) =
-                    object::pod::from_bytes_mut::<object::macho::DysymtabCommand<LE>>(body)
-                        .map_err(|_| anyhow::anyhow!("Truncated dysymtab command"))?;
-                shift(&mut dysymtab.tocoff, delta);
-                shift(&mut dysymtab.modtaboff, delta);
-                shift(&mut dysymtab.extrefsymoff, delta);
-                shift(&mut dysymtab.indirectsymoff, delta);
-                shift(&mut dysymtab.extreloff, delta);
-                shift(&mut dysymtab.locreloff, delta);
-            }
-            LC_DYLD_INFO | LC_DYLD_INFO_ONLY => {
-                let (info, _) =
-                    object::pod::from_bytes_mut::<object::macho::DyldInfoCommand<LE>>(body)
-                        .map_err(|_| anyhow::anyhow!("Truncated dyld info command"))?;
-                shift(&mut info.rebase_off, delta);
-                shift(&mut info.bind_off, delta);
-                shift(&mut info.weak_bind_off, delta);
-                shift(&mut info.lazy_bind_off, delta);
-                shift(&mut info.export_off, delta);
-            }
-            LC_CODE_SIGNATURE
-            | LC_SEGMENT_SPLIT_INFO
-            | LC_FUNCTION_STARTS
-            | LC_DATA_IN_CODE
-            | LC_DYLIB_CODE_SIGN_DRS
-            | LC_LINKER_OPTIMIZATION_HINT
-            | LC_DYLD_EXPORTS_TRIE
-            | LC_DYLD_CHAINED_FIXUPS
-            | LC_ATOM_INFO => {
-                let (linkedit_data, _) =
-                    object::pod::from_bytes_mut::<object::macho::LinkeditDataCommand<LE>>(body)
-                        .map_err(|_| anyhow::anyhow!("Truncated linkedit data command"))?;
-                shift(&mut linkedit_data.dataoff, delta);
-                if cmd == LC_DYLD_CHAINED_FIXUPS {
-                    let datasize = linkedit_data.datasize.get(LE);
-                    linkedit_data.datasize.set(LE, datasize + grow as u32);
-                }
-            }
-            _ => {}
-        }
-        offset += cmdsize;
-    }
-
-    // Shift __LINKEDIT itself.
-    {
-        let body = &mut data[le_off..le_off + size_of::<SegmentCommand64<LE>>()];
-        let (seg, _) = object::pod::from_bytes_mut::<SegmentCommand64<LE>>(body)
-            .map_err(|_| anyhow::anyhow!("Truncated segment command"))?;
-        seg.vmaddr.set(LE, le_vmaddr + delta);
-        seg.fileoff.set(LE, le_fileoff + delta);
-        seg.filesize.set(LE, le_filesize + grow);
-        let vmsize = seg.vmsize.get(LE).max(align_up(le_filesize + grow, page));
-        seg.vmsize.set(LE, vmsize);
-    }
-
-    patch_descriptor(&mut data, desc_off, le_vmaddr, blob.len() as u64)?;
-
-    // Insert the new load command where __LINKEDIT's is (keeping commands ordered by
-    // vmaddr), sliding the tail commands into the headerpad.
-    let new_segment = SegmentCommand64::<LE> {
-        cmd: U32::new(LE, LC_SEGMENT_64),
-        cmdsize: U32::new(LE, NEW_LC_SIZE as u32),
-        segname: *b"__SYMDB\0\0\0\0\0\0\0\0\0",
-        vmaddr: U64::new(LE, le_vmaddr),
-        vmsize: U64::new(LE, delta),
-        fileoff: U64::new(LE, le_fileoff),
-        filesize: U64::new(LE, delta),
-        maxprot: U32::new(LE, VM_PROT_READ),
-        initprot: U32::new(LE, VM_PROT_READ),
-        nsects: U32::new(LE, 1),
-        flags: U32::new(LE, 0),
-    };
-    let new_section = Section64::<LE> {
-        sectname: *b"__symdb\0\0\0\0\0\0\0\0\0",
-        segname: *b"__SYMDB\0\0\0\0\0\0\0\0\0",
-        addr: U64::new(LE, le_vmaddr),
-        size: U64::new(LE, blob.len() as u64),
-        offset: U32::new(LE, le_fileoff as u32),
-        align: U32::new(LE, 3),
-        reloff: U32::new(LE, 0),
-        nreloc: U32::new(LE, 0),
-        flags: U32::new(LE, 0),
-        reserved1: U32::new(LE, 0),
-        reserved2: U32::new(LE, 0),
-        reserved3: U32::new(LE, 0),
-    };
-    data.copy_within(le_off..cmds_end, le_off + NEW_LC_SIZE);
-    data[le_off..le_off + size_of::<SegmentCommand64<LE>>()]
-        .copy_from_slice(bytes_of(&new_segment));
-    data[le_off + size_of::<SegmentCommand64<LE>>()..le_off + NEW_LC_SIZE]
-        .copy_from_slice(bytes_of(&new_section));
-    {
-        let (header, _) = object::pod::from_bytes_mut::<MachHeader64<LE>>(&mut data)
-            .map_err(|_| anyhow::anyhow!("Truncated Mach-O header"))?;
-        header.ncmds.set(LE, (ncmds + 1) as u32);
-        header.sizeofcmds.set(LE, (sizeofcmds + NEW_LC_SIZE) as u32);
-    }
-
-    let mut out = Vec::with_capacity(data.len() + (delta + grow) as usize);
-    out.extend_from_slice(&data[..le_fileoff as usize]);
-    out.extend_from_slice(blob);
-    out.resize((le_fileoff + delta) as usize, 0);
-    match (new_fixups, fixups) {
-        (Some(new_fixups), Some((dataoff, datasize))) => {
-            out.extend_from_slice(&data[le_fileoff as usize..dataoff as usize]);
-            out.extend_from_slice(&new_fixups);
-            out.extend_from_slice(&data[(dataoff + datasize) as usize..]);
-        }
-        _ => out.extend_from_slice(&data[le_fileoff as usize..]),
-    }
-    log::debug!("Mach-O: __SYMDB at vmaddr {le_vmaddr:#x}, {} bytes", blob.len());
-    Ok(out)
+    let inserted = crate::util::macho::insert_segments(data, &[crate::util::macho::SegmentSpec {
+        name: "__SYMDB".into(),
+        data: blob.to_vec(),
+        max_prot: object::macho::VM_PROT_READ,
+        init_prot: object::macho::VM_PROT_READ,
+        sections: vec![crate::util::macho::SectionSpec {
+            name: "__symdb",
+            offset: 0,
+            size: blob.len() as u64,
+            align: 3,
+            flags: object::macho::S_REGULAR,
+        }],
+    }])?;
+    let mut output = inserted.data;
+    patch_descriptor(
+        &mut output,
+        descriptor_offset,
+        inserted.segments[0].vmaddr,
+        blob.len() as u64,
+    )?;
+    Ok(output)
 }

@@ -800,6 +800,7 @@ mod tests {
     use object::{Object, ObjectSymbol};
 
     use super::*;
+    use crate::util::macho::{MachOImage, SectionSpec, SegmentSpec, insert_segments};
 
     #[test]
     fn single_arch_formats_reject_multiple_arches() {
@@ -834,5 +835,37 @@ mod tests {
             .collect::<Vec<_>>();
         exports.sort_unstable();
         assert_eq!(exports, symbols);
+    }
+
+    #[test]
+    fn macho_segment_insertion_round_trips() {
+        let symbols = ["_game_func"];
+        let trie = export_trie(&symbols);
+        let (symtab, strtab) = symbol_table(&symbols);
+        let slice =
+            macho_slice(Arch::Arm64, macho::PLATFORM_MACOS, 0x000B_0000, &trie, &symtab, &strtab);
+
+        let inserted = insert_segments(slice, &[SegmentSpec {
+            name: "__EXTRA".into(),
+            data: vec![0x5a; 16],
+            max_prot: macho::VM_PROT_READ,
+            init_prot: macho::VM_PROT_READ,
+            sections: vec![SectionSpec {
+                name: "__extra",
+                offset: 0,
+                size: 16,
+                align: 3,
+                flags: macho::S_REGULAR,
+            }],
+        }])
+        .unwrap();
+
+        let image = MachOImage::parse(&inserted.data).unwrap();
+        assert!(
+            image.segments().iter().any(|segment| &segment.name == b"__EXTRA\0\0\0\0\0\0\0\0\0")
+        );
+        assert_eq!(image.bytes_at(inserted.segments[0].vmaddr, 16).unwrap(), [0x5a; 16]);
+        let file = object::File::parse(&*inserted.data).unwrap();
+        assert_eq!(file.exports().unwrap()[0].name(), b"_game_func");
     }
 }

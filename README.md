@@ -14,6 +14,7 @@ Symbol pipeline tool for moddable game binaries. Built for [Dusklight](https://g
 - `symgen manifest` scans the fully linked executable and exports a manifest containing all hookable symbols (including
   statics), written to a file or embedded into the executable itself.
 - `symgen modmeta` dumps static mod metadata records embedded in native libraries.
+- `symgen prepatch` installs hook trampolines into an arm64 Mach-O executable for bundled mods.
 
 ## Commands
 
@@ -129,6 +130,21 @@ symgen modmeta --check --update-json mod.json mod.dll mod.so
 - `--out <file>`: write the JSON dump to a file instead of stdout
 - `--update-json <file>`: verify agreement (as `--check`), then merge the package-level keys (`abi`, `imports`,
   `exports`) into an existing JSON file such as a mod's `mod.json`, preserving its other keys
+
+### prepatch
+
+Resolves every hook declared by the supplied mod libraries, verifies that every function is patchable, and installs
+trampolines (gateways) into reusable page-aligned code/data arenas. Repeated invocations reuse existing hook sites and
+free arena records, making patching additive and idempotent. The input must be a thin, non-arm64e macOS, iOS, or tvOS
+executable with an embedded symbol manifest.
+
+```shell
+symgen prepatch --binary Game.app/Game --report prepatch.json mod-a.so mod-b.so
+symgen prepatch --binary Game.app/Game --report prepatch.json --check mod-a.so mod-b.so
+```
+
+`--check` performs the complete audit without modifying the executable. An input set with no hook declarations is a
+successful no-op. The operation invalidates any existing code signature.
 
 ## Manifest format
 
