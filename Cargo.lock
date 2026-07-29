@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "symgen"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "aarchmrs-instructions",
  "aarchmrs-types",

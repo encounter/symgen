@@ -277,17 +277,15 @@ fn pe_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// ELF: append a read-only PT_LOAD at EOF holding the relocated program-header table and
-/// the blob. The phdr table cannot grow in place, and loaders (bionic in particular) expect
-/// it to be covered by a PT_LOAD, so it moves into the new segment — with `p_vaddr ==
-/// p_offset` so a loader that computes `bias + e_phoff` still lands on it. A PT_PHDR entry
-/// is updated (or added, for images without one) to point at the moved table.
+/// ELF: append a read-only PT_LOAD at EOF for the blob. Prefer replacing a spare PT_NULL
+/// after the existing PT_LOAD entries so the program-header table stays in place. If there
+/// is no safely positioned spare, relocate and extend the table as a fallback.
 fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     use object::{
         LittleEndian as LE, U16, U32, U64,
         elf::{
-            ELFCLASS64, ELFDATA2LSB, FileHeader64, PF_R, PT_LOAD, PT_PHDR, ProgramHeader64,
-            SHF_ALLOC, SHT_PROGBITS, SectionHeader64,
+            ELFCLASS64, ELFDATA2LSB, FileHeader64, PF_R, PT_LOAD, PT_NULL, PT_PHDR,
+            ProgramHeader64, SHF_ALLOC, SHT_PROGBITS, SectionHeader64,
         },
     };
 
@@ -362,38 +360,59 @@ fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
 
     let mut align = 0x1000u64;
     let mut vaddr_end = 0u64;
-    for phdr in &phdrs {
+    let mut last_load_index = None;
+    for (index, phdr) in phdrs.iter().enumerate() {
         if phdr.p_type.get(LE) == PT_LOAD {
+            last_load_index = Some(index);
             align = align.max(phdr.p_align.get(LE));
             vaddr_end = vaddr_end.max(phdr.p_vaddr.get(LE) + phdr.p_memsz.get(LE));
         }
     }
-    // One address for both p_offset and p_vaddr: past the end of the file *and* of the
-    // address space, so the file grows in place and no existing segment overlaps.
-    let base = align_up((data.len() as u64).max(vaddr_end), align);
 
-    let phdr_index = phdrs.iter().position(|p| p.p_type.get(LE) == PT_PHDR);
-    let new_phnum = phnum + 1 + usize::from(phdr_index.is_none());
-    let phdrs_size = (new_phnum * PHENT) as u64;
-    let blob_vaddr = base + align_up(phdrs_size, 16);
-    let seg_size = (blob_vaddr - base) + blob.len() as u64;
+    let make_phdr =
+        |p_type: u32, offset: u64, vaddr: u64, size: u64, p_align: u64| ProgramHeader64::<LE> {
+            p_type: U32::new(LE, p_type),
+            p_flags: U32::new(LE, PF_R),
+            p_offset: U64::new(LE, offset),
+            p_vaddr: U64::new(LE, vaddr),
+            p_paddr: U64::new(LE, vaddr),
+            p_filesz: U64::new(LE, size),
+            p_memsz: U64::new(LE, size),
+            p_align: U64::new(LE, p_align),
+        };
 
-    let make_phdr = |p_type: u32, offset: u64, size: u64, p_align: u64| ProgramHeader64::<LE> {
-        p_type: U32::new(LE, p_type),
-        p_flags: U32::new(LE, PF_R),
-        p_offset: U64::new(LE, offset),
-        p_vaddr: U64::new(LE, offset),
-        p_paddr: U64::new(LE, offset),
-        p_filesz: U64::new(LE, size),
-        p_memsz: U64::new(LE, size),
-        p_align: U64::new(LE, p_align),
+    // PT_LOAD entries must be sorted by virtual address. A PT_NULL after the final PT_LOAD
+    // can become the new, highest-addressed load without reordering any program headers.
+    let spare_index = phdrs.iter().enumerate().find_map(|(index, phdr)| {
+        (phdr.p_type.get(LE) == PT_NULL && last_load_index.is_none_or(|last| index > last))
+            .then_some(index)
+    });
+
+    let (blob_offset, blob_vaddr, relocated_phoff) = if let Some(index) = spare_index {
+        let blob_offset = align_up(data.len() as u64, align);
+        let blob_vaddr = align_up(vaddr_end, align);
+        phdrs[index] = make_phdr(PT_LOAD, blob_offset, blob_vaddr, blob.len() as u64, align);
+        log::debug!("ELF: reused spare program header at index {index}");
+        (blob_offset, blob_vaddr, None)
+    } else {
+        // The table cannot grow in place. Loaders (bionic in particular) expect it to be
+        // covered by a PT_LOAD, so move it into a new segment with p_vaddr == p_offset.
+        let base = align_up((data.len() as u64).max(vaddr_end), align);
+        let phdr_index = phdrs.iter().position(|p| p.p_type.get(LE) == PT_PHDR);
+        let new_phnum = phnum + 1 + usize::from(phdr_index.is_none());
+        let phdrs_size = (new_phnum * PHENT) as u64;
+        let blob_vaddr = base + align_up(phdrs_size, 16);
+        let seg_size = (blob_vaddr - base) + blob.len() as u64;
+
+        match phdr_index {
+            Some(i) => phdrs[i] = make_phdr(PT_PHDR, base, base, phdrs_size, 8),
+            // PT_PHDR must precede any PT_LOAD.
+            None => phdrs.insert(0, make_phdr(PT_PHDR, base, base, phdrs_size, 8)),
+        }
+        phdrs.push(make_phdr(PT_LOAD, base, base, seg_size, align));
+        log::debug!("ELF: relocated program headers; no safe PT_NULL entry was available");
+        (blob_vaddr, blob_vaddr, Some(base))
     };
-    match phdr_index {
-        Some(i) => phdrs[i] = make_phdr(PT_PHDR, base, phdrs_size, 8),
-        // PT_PHDR must precede any PT_LOAD.
-        None => phdrs.insert(0, make_phdr(PT_PHDR, base, phdrs_size, 8)),
-    }
-    phdrs.push(make_phdr(PT_LOAD, base, seg_size, align));
 
     // Rebuilt section metadata (never loaded, appended past the new segment): the extended
     // .shstrtab, then the section table with the shstrtab entry retargeted and a `symdb`
@@ -401,7 +420,7 @@ fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     let name_off = strtab.len() as u32;
     let mut new_strtab = strtab.clone();
     new_strtab.extend_from_slice(b"symdb\0");
-    let new_strtab_off = blob_vaddr + blob.len() as u64;
+    let new_strtab_off = blob_offset + blob.len() as u64;
     let new_shoff = align_up(new_strtab_off + new_strtab.len() as u64, 8);
 
     shdrs[shstrndx].sh_offset = U64::new(LE, new_strtab_off);
@@ -411,7 +430,7 @@ fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
         sh_type: U32::new(LE, SHT_PROGBITS),
         sh_flags: U64::new(LE, SHF_ALLOC.into()),
         sh_addr: U64::new(LE, blob_vaddr),
-        sh_offset: U64::new(LE, blob_vaddr),
+        sh_offset: U64::new(LE, blob_offset),
         sh_size: U64::new(LE, blob.len() as u64),
         sh_link: U32::new(LE, 0),
         sh_info: U32::new(LE, 0),
@@ -424,17 +443,26 @@ fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     {
         let (ehdr, _) = object::pod::from_bytes_mut::<FileHeader64<LE>>(&mut data)
             .map_err(|_| anyhow::anyhow!("Truncated ELF header"))?;
-        ehdr.e_phoff = U64::new(LE, base);
-        ehdr.e_phnum = U16::new(LE, new_phnum as u16);
+        if let Some(offset) = relocated_phoff {
+            ehdr.e_phoff = U64::new(LE, offset);
+            ehdr.e_phnum = U16::new(LE, phdrs.len() as u16);
+        }
         ehdr.e_shoff = U64::new(LE, new_shoff);
         ehdr.e_shnum = U16::new(LE, shdrs.len() as u16);
     }
 
-    data.resize(base as usize, 0);
-    for phdr in &phdrs {
-        data.extend_from_slice(bytes_of(phdr));
+    if let Some(offset) = relocated_phoff {
+        data.resize(offset as usize, 0);
+        for phdr in &phdrs {
+            data.extend_from_slice(bytes_of(phdr));
+        }
+    } else {
+        for (index, phdr) in phdrs.iter().enumerate() {
+            let start = phoff + index * PHENT;
+            data[start..start + PHENT].copy_from_slice(bytes_of(phdr));
+        }
     }
-    data.resize(blob_vaddr as usize, 0);
+    data.resize(blob_offset as usize, 0);
     data.extend_from_slice(blob);
     data.extend_from_slice(&new_strtab);
     data.resize(new_shoff as usize, 0);
@@ -483,4 +511,179 @@ fn macho_embed(data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
         blob.len() as u64,
     )?;
     crate::util::macho::remove_code_signature(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use object::{
+        LittleEndian as LE, Object, ObjectSection, U16, U32, U64,
+        elf::{self, FileHeader64, ProgramHeader64, SectionHeader64},
+        pod::{bytes_of, from_bytes, slice_from_bytes},
+    };
+
+    use super::*;
+
+    const DESCRIPTOR_OFFSET: usize = 0x200;
+
+    fn test_elf(phdr_types: &[u32]) -> Vec<u8> {
+        const EHDR_SIZE: usize = size_of::<FileHeader64<LE>>();
+        const PHENT: usize = size_of::<ProgramHeader64<LE>>();
+        const SHENT: usize = size_of::<SectionHeader64<LE>>();
+
+        let phoff = EHDR_SIZE;
+        let shstrtab = b"\0symdbh\0.shstrtab\0";
+        let shstrtab_offset = DESCRIPTOR_OFFSET + DESCRIPTOR_SIZE;
+        let shoff = (shstrtab_offset + shstrtab.len()).next_multiple_of(8);
+        let phdrs_size = phdr_types.len() * PHENT;
+
+        let ehdr = FileHeader64::<LE> {
+            e_ident: elf::Ident {
+                magic: elf::ELFMAG,
+                class: elf::ELFCLASS64,
+                data: elf::ELFDATA2LSB,
+                version: elf::EV_CURRENT,
+                os_abi: elf::ELFOSABI_NONE,
+                abi_version: 0,
+                padding: [0; 7],
+            },
+            e_type: U16::new(LE, elf::ET_DYN),
+            e_machine: U16::new(LE, elf::EM_X86_64),
+            e_version: U32::new(LE, elf::EV_CURRENT.into()),
+            e_entry: U64::new(LE, 0),
+            e_phoff: U64::new(LE, phoff as u64),
+            e_shoff: U64::new(LE, shoff as u64),
+            e_flags: U32::new(LE, 0),
+            e_ehsize: U16::new(LE, EHDR_SIZE as u16),
+            e_phentsize: U16::new(LE, PHENT as u16),
+            e_phnum: U16::new(LE, phdr_types.len() as u16),
+            e_shentsize: U16::new(LE, SHENT as u16),
+            e_shnum: U16::new(LE, 3),
+            e_shstrndx: U16::new(LE, 2),
+        };
+
+        let phdr = |p_type: u32| {
+            let (offset, vaddr, size, align) = match p_type {
+                elf::PT_PHDR => (phoff as u64, phoff as u64, phdrs_size as u64, 8),
+                elf::PT_LOAD => (0, 0, (DESCRIPTOR_OFFSET + DESCRIPTOR_SIZE) as u64, 0x1000),
+                _ => (0, 0, 0, 0),
+            };
+            ProgramHeader64::<LE> {
+                p_type: U32::new(LE, p_type),
+                p_flags: U32::new(LE, elf::PF_R),
+                p_offset: U64::new(LE, offset),
+                p_vaddr: U64::new(LE, vaddr),
+                p_paddr: U64::new(LE, vaddr),
+                p_filesz: U64::new(LE, size),
+                p_memsz: U64::new(LE, size),
+                p_align: U64::new(LE, align),
+            }
+        };
+        let phdrs = phdr_types.iter().copied().map(phdr).collect::<Vec<_>>();
+
+        let shdr = |name: u32, sh_type: u32, flags: u64, addr: u64, offset: u64, size: u64| {
+            SectionHeader64::<LE> {
+                sh_name: U32::new(LE, name),
+                sh_type: U32::new(LE, sh_type),
+                sh_flags: U64::new(LE, flags),
+                sh_addr: U64::new(LE, addr),
+                sh_offset: U64::new(LE, offset),
+                sh_size: U64::new(LE, size),
+                sh_link: U32::new(LE, 0),
+                sh_info: U32::new(LE, 0),
+                sh_addralign: U64::new(LE, 8),
+                sh_entsize: U64::new(LE, 0),
+            }
+        };
+        let shdrs = [
+            shdr(0, elf::SHT_NULL, 0, 0, 0, 0),
+            shdr(
+                1,
+                elf::SHT_PROGBITS,
+                elf::SHF_ALLOC.into(),
+                DESCRIPTOR_OFFSET as u64,
+                DESCRIPTOR_OFFSET as u64,
+                DESCRIPTOR_SIZE as u64,
+            ),
+            shdr(8, elf::SHT_STRTAB, 0, 0, shstrtab_offset as u64, shstrtab.len() as u64),
+        ];
+
+        let mut data = vec![0; shoff + shdrs.len() * SHENT];
+        data[..EHDR_SIZE].copy_from_slice(bytes_of(&ehdr));
+        for (index, header) in phdrs.iter().enumerate() {
+            let offset = phoff + index * PHENT;
+            data[offset..offset + PHENT].copy_from_slice(bytes_of(header));
+        }
+        data[DESCRIPTOR_OFFSET..DESCRIPTOR_OFFSET + 8]
+            .copy_from_slice(&DESCRIPTOR_MAGIC.to_le_bytes());
+        data[shstrtab_offset..shstrtab_offset + shstrtab.len()].copy_from_slice(shstrtab);
+        for (index, header) in shdrs.iter().enumerate() {
+            let offset = shoff + index * SHENT;
+            data[offset..offset + SHENT].copy_from_slice(bytes_of(header));
+        }
+        data
+    }
+
+    fn elf_headers(data: &[u8]) -> (FileHeader64<LE>, Vec<ProgramHeader64<LE>>) {
+        let (ehdr, _) = from_bytes::<FileHeader64<LE>>(data).unwrap();
+        let phoff = ehdr.e_phoff.get(LE) as usize;
+        let phnum = ehdr.e_phnum.get(LE) as usize;
+        let (phdrs, _) = slice_from_bytes::<ProgramHeader64<LE>>(&data[phoff..], phnum).unwrap();
+        (*ehdr, phdrs.to_vec())
+    }
+
+    #[test]
+    fn elf_embed_reuses_safe_pt_null() {
+        let input = test_elf(&[elf::PT_PHDR, elf::PT_LOAD, elf::PT_GNU_STACK, elf::PT_NULL]);
+        let (input_ehdr, input_phdrs) = elf_headers(&input);
+        let blob = b"manifest";
+
+        let output = elf_embed(input, blob).unwrap();
+        let (output_ehdr, output_phdrs) = elf_headers(&output);
+
+        assert_eq!(output_ehdr.e_phoff.get(LE), input_ehdr.e_phoff.get(LE));
+        assert_eq!(output_ehdr.e_phnum.get(LE), input_ehdr.e_phnum.get(LE));
+        assert_eq!(
+            bytes_of(&output_phdrs[0]),
+            bytes_of(&input_phdrs[0]),
+            "PT_PHDR must remain unchanged"
+        );
+        let symdb_load = output_phdrs.last().unwrap();
+        assert_eq!(symdb_load.p_type.get(LE), elf::PT_LOAD);
+        assert_eq!(symdb_load.p_offset.get(LE), 0x1000);
+        assert_eq!(symdb_load.p_vaddr.get(LE), 0x1000);
+        assert_eq!(symdb_load.p_filesz.get(LE), blob.len() as u64);
+        assert_eq!(&output[0x1000..0x1000 + blob.len()], blob);
+
+        assert_eq!(
+            u64::from_le_bytes(
+                output[DESCRIPTOR_OFFSET + 8..DESCRIPTOR_OFFSET + 16].try_into().unwrap()
+            ),
+            0x1000
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                output[DESCRIPTOR_OFFSET + 16..DESCRIPTOR_OFFSET + 24].try_into().unwrap()
+            ),
+            blob.len() as u64
+        );
+
+        let file = object::File::parse(&*output).unwrap();
+        let section = file.section_by_name("symdb").unwrap();
+        assert_eq!(section.address(), 0x1000);
+        assert_eq!(section.data().unwrap(), blob);
+    }
+
+    #[test]
+    fn elf_embed_does_not_reuse_pt_null_before_a_load() {
+        let input = test_elf(&[elf::PT_PHDR, elf::PT_NULL, elf::PT_LOAD, elf::PT_GNU_STACK]);
+        let (input_ehdr, _) = elf_headers(&input);
+
+        let output = elf_embed(input, b"manifest").unwrap();
+        let (output_ehdr, output_phdrs) = elf_headers(&output);
+
+        assert_ne!(output_ehdr.e_phoff.get(LE), input_ehdr.e_phoff.get(LE));
+        assert_eq!(output_ehdr.e_phnum.get(LE), input_ehdr.e_phnum.get(LE) + 1);
+        assert_eq!(output_phdrs[1].p_type.get(LE), elf::PT_NULL);
+        assert_eq!(output_phdrs.last().unwrap().p_type.get(LE), elf::PT_LOAD);
+    }
 }
