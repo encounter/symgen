@@ -698,7 +698,8 @@ fn read_u32(blob: &[u8], off: usize) -> Result<u32> {
 }
 
 /// Add adjacent fixup-free segment entries to dyld's starts-in-image table in one operation.
-/// The offset array and its trailing alignment are grown by the exact required byte count.
+/// Round growth to preserve the alignment of all following linkedit records, including the
+/// 16-byte-aligned code signature.
 fn grow_chained_fixups(
     blob: &[u8],
     insert_index: usize,
@@ -732,9 +733,13 @@ fn grow_chained_fixups(
     let new_array_size = 4usize
         .checked_add(new_count.checked_mul(4).context("Chained fixups array size overflows")?)
         .context("Chained fixups array size overflows")?;
-    let new_relative_tail = usize::try_from(align_up(new_array_size as u64, 8)?)
+    let required_relative_tail = usize::try_from(align_up(new_array_size as u64, 8)?)
         .context("Chained fixups array size is too large")?;
-    let growth = new_relative_tail - old_relative_tail;
+    let required_growth = required_relative_tail - old_relative_tail;
+    let growth = usize::try_from(align_up(required_growth as u64, 16)?)
+        .context("Chained fixups growth is too large")?;
+    let new_relative_tail =
+        old_relative_tail.checked_add(growth).context("Chained fixups array size overflows")?;
     let old_tail =
         starts_offset.checked_add(old_relative_tail).context("Chained fixups offset overflows")?;
     let new_tail =
@@ -1375,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn chained_fixup_growth_is_alignment_aware() {
+    fn chained_fixup_growth_preserves_linkedit_alignment() {
         // Header + starts_in_image with three entries and an 8-byte-aligned tail.
         let mut blob = vec![0u8; 28];
         blob[4..8].copy_from_slice(&28u32.to_le_bytes());
@@ -1387,16 +1392,17 @@ mod tests {
         blob.extend_from_slice(&24u32.to_le_bytes());
         blob.extend_from_slice(&[0xaa; 8]);
         let (grown, growth) = grow_chained_fixups(&blob, 2, 2, 3).unwrap();
-        assert_eq!(growth, 8);
+        assert_eq!(growth, 16);
+        assert_eq!(growth % 16, 0);
         assert_eq!(read_u32(&grown, 28).unwrap(), 5);
-        assert_eq!(read_u32(&grown, 32).unwrap(), 24);
+        assert_eq!(read_u32(&grown, 32).unwrap(), 32);
         assert_eq!(read_u32(&grown, 36).unwrap(), 0);
         assert_eq!(read_u32(&grown, 40).unwrap(), 0);
         assert_eq!(read_u32(&grown, 44).unwrap(), 0);
-        assert_eq!(read_u32(&grown, 48).unwrap(), 32);
-        assert_eq!(read_u32(&grown, 8).unwrap(), 52);
-        assert_eq!(read_u32(&grown, 12).unwrap(), 56);
-        assert_eq!(&grown[52..], &[0xaa; 8]);
+        assert_eq!(read_u32(&grown, 48).unwrap(), 40);
+        assert_eq!(read_u32(&grown, 8).unwrap(), 60);
+        assert_eq!(read_u32(&grown, 12).unwrap(), 64);
+        assert_eq!(&grown[60..], &[0xaa; 8]);
     }
 
     #[test]
