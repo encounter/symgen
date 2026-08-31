@@ -87,6 +87,25 @@ fn is_skip_symbol(name: &str) -> bool {
     PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+enum FunctionKind {
+    Normal,
+    /// Outlined fragment of another function (exclude these)
+    Fragment,
+    /// Compiler-specialized copy (no display alias for these)
+    Specialization,
+}
+
+fn function_kind(name: &str) -> FunctionKind {
+    if let Some((_, suffix)) = name.split_once('.') {
+        return match suffix.split('.').next().unwrap_or(suffix) {
+            // `foo.cold`, `foo.part.0`, etc.
+            "cold" | "part" => FunctionKind::Fragment,
+            _ => FunctionKind::Specialization,
+        };
+    }
+    FunctionKind::Normal
+}
+
 /// Mangled names whose demangling is not a plain qualified name (vtables, typeinfo,
 /// thunks, guard variables, function-scope statics, Rust v0), so no display alias.
 fn is_special_mangled(name: &str) -> bool {
@@ -159,8 +178,18 @@ fn read_binary(path: &Path) -> Result<ManifestInput> {
         // use the same spelling on every platform.
         let name = if is_macho { name.strip_prefix('_').unwrap_or(name) } else { name };
         let rva = sym.address().wrapping_sub(base);
-        if let Some(display) = display_name(name) {
-            symbols.push(ManifestSymbol { name: display, rva, flags: flags | FLAG_DISPLAY });
+        match function_kind(name) {
+            FunctionKind::Fragment => continue,
+            FunctionKind::Specialization => {}
+            FunctionKind::Normal => {
+                if let Some(display) = display_name(name) {
+                    symbols.push(ManifestSymbol {
+                        name: display,
+                        rva,
+                        flags: flags | FLAG_DISPLAY,
+                    });
+                }
+            }
         }
         symbols.push(ManifestSymbol { name: name.to_string(), rva, flags });
     }
