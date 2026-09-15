@@ -182,7 +182,7 @@ Entry flags:
 | `MULTI_NAME`   | 3   | Multiple names resolve to this RVA (ICF fold or alias)                     |
 | `DUP_NAME`     | 4   | This name maps to multiple RVAs; by-name lookup must treat it as ambiguous |
 | `INLINE_SITES` | 5   | Inlined into at least one caller; an entry hook misses the inlined calls   |
-| `DISPLAY`      | 6   | Demangled display-name alias generated beside the real symbol name         |
+| `DISPLAY`      | 6   | Demangled or TU alias generated alongside the symbol                       |
 
 ## License
 

@@ -6,6 +6,14 @@ use std::{
 
 use anyhow::{Context, Result};
 
+/// Open and memory map a file.
+pub fn map_file(path: &Path) -> Result<memmap2::Mmap> {
+    let file =
+        fs::File::open(path).with_context(|| format!("Failed to open '{}'", path.display()))?;
+    unsafe { memmap2::Mmap::map(&file) }
+        .with_context(|| format!("Failed to map '{}'", path.display()))
+}
+
 /// Expand command-line inputs prefixed with `@` as response files.
 pub fn process_rsp(inputs: &[String]) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(inputs.len());

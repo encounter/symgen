@@ -9,7 +9,7 @@ publish = false
 repository = "https://github.com/encounter/symgen"
 readme = "README.md"
 categories = ["command-line-utilities"]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [profile.release]
 panic = "abort"
@@ -26,12 +26,15 @@ aarchmrs-types = "0.1.2"
 anyhow = { version = "1.0", features = ["backtrace"] }
 argp = "0.4"
 cpp_demangle = "0.5"
+gimli = { version = "0.34", default-features = false, features = ["read", "std"] }
 enable-ansi-support = "0.3"
 iced-x86 = { version = "1.21", default-features = false, features = ["decoder", "std"] }
 implib = { version = "0.6.0", default-features = false, features = ["msvc"] }
 log = "0.4"
-object = { version = "0.39", default-features = false, features = ["read", "archive", "coff", "elf", "macho", "std"] }
+memmap2 = "0.9.11"
+object = { version = "0.39.1", default-features = false, features = ["read", "archive", "coff", "elf", "macho", "std", "compression"] }
 pdb = "0.8"
+rayon = "1.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 supports-color = "3.0"

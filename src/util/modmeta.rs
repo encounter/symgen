@@ -225,7 +225,7 @@ pub fn parse_library(data: &[u8]) -> Result<MetaFile> {
         }
         let (header, _) = RecordHeader::read_from_prefix(rest).unwrap();
         let size = header.size.get() as usize;
-        if size < 8 || size % 8 != 0 || size > rest.len() {
+        if size < 8 || !size.is_multiple_of(8) || size > rest.len() {
             bail!("Bad record size {size} at section offset {offset}");
         }
         let record_data = &rest[..size];

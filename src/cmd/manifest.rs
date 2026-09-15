@@ -8,6 +8,13 @@ use anyhow::{Context, Result, bail};
 use argp::FromArgs;
 use pdb::FallibleIterator;
 
+mod aliases;
+mod apple;
+mod dwarf;
+mod provenance;
+
+use aliases::SourceRoot;
+
 use crate::util::manifest::{
     FLAG_CODE, FLAG_DATA, FLAG_DISPLAY, FLAG_INLINE_SITES, FLAG_LOCAL, ManifestCompression,
     ManifestInput, ManifestOptions, ManifestSymbol, build_manifest_with_options,
@@ -35,11 +42,21 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> Result<()> {
-    let input = match (&args.pdb, &args.binary) {
-        (Some(pdb), _) => read_pdb(pdb)?,
-        (None, Some(binary)) => read_binary(binary)?,
+    let root = SourceRoot::current()?;
+    let threads = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .min(32);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build()?;
+    let started = std::time::Instant::now();
+    let input = pool.install(|| match (&args.pdb, &args.binary) {
+        (Some(pdb), _) => read_pdb(pdb, &root),
+        (None, Some(binary)) => read_binary(binary, &root),
         (None, None) => bail!("Either --pdb (Windows) or --binary is required"),
-    };
+    })?;
+    log::debug!("Symbol and TU discovery: {:?}", started.elapsed());
     let compression =
         if args.no_compress { ManifestCompression::None } else { ManifestCompression::Zstd };
     let (data, entries) = build_manifest_with_options(&input, ManifestOptions { compression })?;
@@ -51,8 +68,10 @@ pub fn run(args: Args) -> Result<()> {
             .with_context(|| format!("Failed to write manifest '{}'", out.display()))?;
     }
     if let Some(image) = &args.embed {
+        let started = std::time::Instant::now();
         crate::util::embed::embed(image, &data)
             .with_context(|| format!("Failed to embed manifest into '{}'", image.display()))?;
+        log::debug!("Manifest embedding: {:?}", started.elapsed());
     }
     log::debug!(
         "Wrote {} entries ({} raw records), {} bytes, {} compression, build id {}",
@@ -139,11 +158,11 @@ fn is_rust_legacy(display: &str) -> bool {
 }
 
 /// Symbols + build id from a linked Mach-O / ELF binary's symtab.
-fn read_binary(path: &Path) -> Result<ManifestInput> {
+fn read_binary(path: &Path, root: &SourceRoot) -> Result<ManifestInput> {
     use object::{Object, ObjectSymbol};
 
-    let data =
-        fs::read(path).with_context(|| format!("Failed to read binary '{}'", path.display()))?;
+    let started = std::time::Instant::now();
+    let data = crate::util::file::map_file(path)?;
     let file = object::File::parse(&*data)
         .with_context(|| format!("Failed to parse binary '{}'", path.display()))?;
 
@@ -193,15 +212,24 @@ fn read_binary(path: &Path) -> Result<ManifestInput> {
         }
         symbols.push(ManifestSymbol { name: name.to_string(), rva, flags });
     }
+    log::debug!("Raw symbol scan: {:?}", started.elapsed());
+    let started = std::time::Instant::now();
+    let aliases = if is_macho {
+        apple::aliases(&file, root, &symbols)?
+    } else {
+        dwarf::elf_aliases(&file, root, &symbols)?
+    };
+    log::debug!("{} TU alias candidates", aliases.len());
+    log::debug!("Debug parsing and TU aliases: {:?}", started.elapsed());
+    symbols.extend(aliases);
     Ok(ManifestInput { build_id, symbols })
 }
 
 /// Symbols + build id from a PDB: publics (linkable surface) plus per-module
 /// procedure/data records (statics).
-fn read_pdb(path: &Path) -> Result<ManifestInput> {
-    let file =
-        fs::File::open(path).with_context(|| format!("Failed to open PDB '{}'", path.display()))?;
-    let mut pdb = pdb::PDB::open(file)
+fn read_pdb(path: &Path, root: &SourceRoot) -> Result<ManifestInput> {
+    let data = crate::util::file::map_file(path)?;
+    let mut pdb = pdb::PDB::open(std::io::Cursor::new(&*data))
         .with_context(|| format!("Failed to parse PDB '{}'", path.display()))?;
     let info = pdb.pdb_information()?;
     let dbi = pdb.debug_information()?;
@@ -233,11 +261,16 @@ fn read_pdb(path: &Path) -> Result<ManifestInput> {
         Default::default()
     });
 
+    let provenance = provenance::BuildInfo::read(&mut pdb)?;
+    let strings = pdb.string_table().ok();
     let mut modules = dbi.modules()?;
     while let Some(module) = modules.next()? {
         let Some(module_info) = pdb.module_info(&module)? else {
             continue;
         };
+        let source = provenance
+            .source(&module_info, strings.as_ref(), root)
+            .with_context(|| format!("TU provenance for PDB module '{}'", module.module_name()))?;
         let mut sym_iter = module_info.symbols()?;
         while let Some(symbol) = sym_iter.next()? {
             let Ok(data) = symbol.parse() else { continue };
@@ -263,6 +296,19 @@ fn read_pdb(path: &Path) -> Result<ManifestInput> {
             let mut flags = flags;
             if flags & FLAG_CODE != 0 && inlined_names.contains(&name) {
                 flags |= FLAG_INLINE_SITES;
+            }
+            if flags & FLAG_CODE != 0
+                && let Some(source) = &source
+                && let Some(alias) = (aliases::FunctionRecord {
+                    source: source.clone(),
+                    name: name.clone(),
+                    rva: u64::from(rva.0),
+                    flags,
+                    provenance: module.module_name().into_owned(),
+                })
+                .into_alias()
+            {
+                symbols.push(alias);
             }
             symbols.push(ManifestSymbol { name, rva: u64::from(rva.0), flags });
         }
@@ -291,7 +337,9 @@ fn read_pdb(path: &Path) -> Result<ManifestInput> {
 }
 
 /// Qualified names of every function that appears as an inlinee somewhere in the PDB.
-fn collect_inlined_names(pdb: &mut pdb::PDB<'_, fs::File>) -> Result<HashSet<String>> {
+fn collect_inlined_names<'s, S: pdb::Source<'s> + 's>(
+    pdb: &mut pdb::PDB<'s, S>,
+) -> Result<HashSet<String>> {
     // TPI: class/struct names for member-function parents.
     let type_information = pdb.type_information()?;
     let mut class_names: HashMap<u32, String> = HashMap::new();

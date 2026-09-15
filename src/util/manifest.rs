@@ -80,7 +80,7 @@ pub const FLAG_DUP_NAME: u32 = 1 << 4;
 /// This function was inlined into at least one caller in this build (PDB inlinee
 /// records): an entry hook on it only intercepts the calls that were not inlined.
 pub const FLAG_INLINE_SITES: u32 = 1 << 5;
-/// A demangled display-name alias generated alongside the real (mangled) entry, so
+/// A display-name or TU-qualified alias generated alongside the real entry, so
 /// `Class::method` resolves on every platform. Excluded from MULTI_NAME accounting,
 /// and dropped when it collides with a real symbol's name at a different address.
 pub const FLAG_DISPLAY: u32 = 1 << 6;
@@ -378,14 +378,18 @@ pub fn build_manifest_with_options(
     input: &ManifestInput,
     options: ManifestOptions,
 ) -> Result<(Vec<u8>, usize)> {
+    let started = std::time::Instant::now();
     let (payload, entries) = build_manifest_payload(input)?;
+    log::debug!("Manifest merge and serialization: {:?}", started.elapsed());
     let entry_count = u32::try_from(entries).context("Entry count exceeds u32")?;
     let uncompressed_len = payload.len();
+    let started = std::time::Instant::now();
     let encoded_payload = match options.compression {
         ManifestCompression::None => payload,
         ManifestCompression::Zstd => zstd::stream::encode_all(payload.as_slice(), ZSTD_LEVEL)
             .context("Failed to zstd-compress manifest")?,
     };
+    log::debug!("Manifest compression: {:?}", started.elapsed());
     let (build_id, build_id_len) = build_id_field(input);
     let header = ManifestHeader {
         magic: MAGIC,
@@ -589,5 +593,58 @@ mod tests {
         );
         assert_eq!(manifest.lookup("fo"), Err(LookupError::NotFound));
         assert_eq!(manifest.lookup("duplicate"), Err(LookupError::Ambiguous));
+    }
+
+    #[test]
+    fn tu_aliases_preserve_conflicts_flags_and_real_name_precedence() {
+        let code = FLAG_CODE | FLAG_LOCAL;
+        let alias = code | FLAG_DISPLAY | FLAG_INLINE_SITES;
+        let mut input = ManifestInput {
+            build_id: vec![0xab; 16],
+            symbols: vec![
+                ManifestSymbol { name: "_ZL6actioni".into(), rva: 0x1000, flags: code },
+                ManifestSymbol { name: "_ZL6actioni".into(), rva: 0x2000, flags: code },
+                ManifestSymbol { name: "a/shared.cpp#action".into(), rva: 0x1000, flags: alias },
+                ManifestSymbol { name: "a/shared.cpp#action".into(), rva: 0x1000, flags: alias },
+                ManifestSymbol { name: "b/shared.cpp#action".into(), rva: 0x2000, flags: alias },
+                ManifestSymbol {
+                    name: "a/shared.cpp#overloaded".into(),
+                    rva: 0x3000,
+                    flags: alias,
+                },
+                ManifestSymbol {
+                    name: "a/shared.cpp#overloaded".into(),
+                    rva: 0x4000,
+                    flags: alias,
+                },
+                ManifestSymbol { name: "real.cpp#name".into(), rva: 0x5000, flags: code },
+                ManifestSymbol { name: "real.cpp#name".into(), rva: 0x6000, flags: alias },
+            ],
+        };
+        let (payload, entry_count) = build_manifest_payload(&input).unwrap();
+        assert_eq!(entry_count, 7);
+        input.symbols.reverse();
+        assert_eq!(build_manifest_payload(&input).unwrap().0, payload);
+        let manifest = EmbeddedManifest {
+            strings_off: entry_count * size_of::<ManifestEntry>(),
+            payload,
+            entry_count,
+            build_uuid: [0xab; 16],
+        };
+        assert_eq!(
+            manifest.lookup("a/shared.cpp#action"),
+            Ok(ManifestLookup { vmaddr: 0x1000, flags: alias })
+        );
+        assert_eq!(
+            manifest.lookup("b/shared.cpp#action"),
+            Ok(ManifestLookup { vmaddr: 0x2000, flags: alias })
+        );
+        assert_eq!(manifest.lookup("a/shared.cpp#overloaded"), Err(LookupError::Ambiguous));
+        assert_eq!(manifest.lookup("_ZL6actioni"), Err(LookupError::Ambiguous));
+        assert_eq!(
+            manifest.lookup("real.cpp#name"),
+            Ok(ManifestLookup { vmaddr: 0x5000, flags: code })
+        );
+        assert_eq!(manifest.lookup("a\\shared.cpp#action"), Err(LookupError::NotFound));
     }
 }
