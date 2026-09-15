@@ -2,7 +2,7 @@
 //!
 //! A symbol manifest is a post-link artifact (symbol addresses and the build id only exist
 //! after the link), so it cannot be embedded at compile time. Instead, the program compiles
-//! in a small zeroed descriptor in a dedicated section (`symdbh`), and this module appends
+//! in a small zeroed descriptor in a dedicated section (`symdbh`), and this module embeds
 //! the manifest as a new section/segment and patches the descriptor with its address and
 //! size. No relocations are created: the runtime computes `image base + rva`.
 
@@ -277,9 +277,8 @@ fn pe_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// ELF: append a read-only PT_LOAD at EOF for the blob. Prefer replacing a spare PT_NULL
-/// after the existing PT_LOAD entries so the program-header table stays in place. If there
-/// is no safely positioned spare, relocate and extend the table as a fallback.
+/// ELF: add a read-only PT_LOAD for the blob. Reuse a trailing PT_NULL when available;
+/// otherwise prepend a segment containing the ELF header, PHDRs, and blob.
 fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     use object::{
         LittleEndian as LE, U16, U32, U64,
@@ -356,7 +355,7 @@ fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
             _ => {}
         }
     }
-    let desc_off = desc_off.ok_or_else(|| no_descriptor("symdbh"))?;
+    let mut desc_off = desc_off.ok_or_else(|| no_descriptor("symdbh"))?;
 
     let mut align = 0x1000u64;
     let mut vaddr_end = 0u64;
@@ -388,30 +387,51 @@ fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
             .then_some(index)
     });
 
-    let (blob_offset, blob_vaddr, relocated_phoff) = if let Some(index) = spare_index {
+    let (blob_offset, blob_vaddr, output_phoff) = if let Some(index) = spare_index {
         let blob_offset = align_up(data.len() as u64, align);
         let blob_vaddr = align_up(vaddr_end, align);
         phdrs[index] = make_phdr(PT_LOAD, blob_offset, blob_vaddr, blob.len() as u64, align);
         log::debug!("ELF: reused spare program header at index {index}");
-        (blob_offset, blob_vaddr, None)
+        (blob_offset, blob_vaddr, phoff)
     } else {
-        // The table cannot grow in place. Loaders (bionic in particular) expect it to be
-        // covered by a PT_LOAD, so move it into a new segment with p_vaddr == p_offset.
-        let base = align_up((data.len() as u64).max(vaddr_end), align);
+        // If we don't have room to add a PT_LOAD, rewrite the file with a new header
+        // and PHDR table at the front. Virtual addresses are left alone and the file
+        // contents are shifted by whole pages to preserve alignment.
+        let base = align_up(vaddr_end, align);
         let phdr_index = phdrs.iter().position(|p| p.p_type.get(LE) == PT_PHDR);
         let new_phnum = phnum + 1 + usize::from(phdr_index.is_none());
         let phdrs_size = (new_phnum * PHENT) as u64;
-        let blob_vaddr = base + align_up(phdrs_size, 16);
-        let seg_size = (blob_vaddr - base) + blob.len() as u64;
+        let output_phoff = size_of::<FileHeader64<LE>>();
+        let blob_offset = align_up(output_phoff as u64 + phdrs_size, 16);
+        let blob_vaddr = base + blob_offset;
+        let seg_size = blob_offset + blob.len() as u64;
+        let shift = align_up(seg_size, align);
 
-        match phdr_index {
-            Some(i) => phdrs[i] = make_phdr(PT_PHDR, base, base, phdrs_size, 8),
-            // PT_PHDR must precede any PT_LOAD.
-            None => phdrs.insert(0, make_phdr(PT_PHDR, base, base, phdrs_size, 8)),
+        for phdr in &mut phdrs {
+            if phdr.p_filesz.get(LE) != 0 || phdr.p_memsz.get(LE) != 0 {
+                phdr.p_offset.set(LE, phdr.p_offset.get(LE) + shift);
+            }
         }
-        phdrs.push(make_phdr(PT_LOAD, base, base, seg_size, align));
-        log::debug!("ELF: relocated program headers; no safe PT_NULL entry was available");
-        (blob_vaddr, blob_vaddr, Some(base))
+        for shdr in shdrs.iter_mut().skip(1) {
+            shdr.sh_offset.set(LE, shdr.sh_offset.get(LE) + shift);
+        }
+        let original_len = data.len();
+        data.resize(original_len + shift as usize, 0);
+        data.copy_within(..original_len, shift as usize);
+        data[..shift as usize].fill(0);
+        data[..size_of::<FileHeader64<LE>>()].copy_from_slice(bytes_of(&ehdr));
+        desc_off += shift as usize;
+
+        let phdr =
+            make_phdr(PT_PHDR, output_phoff as u64, base + output_phoff as u64, phdrs_size, 8);
+        match phdr_index {
+            Some(i) => phdrs[i] = phdr,
+            // PT_PHDR must precede any PT_LOAD.
+            None => phdrs.insert(0, phdr),
+        }
+        phdrs.push(make_phdr(PT_LOAD, 0, base, seg_size, align));
+        log::debug!("ELF: prepended headers and symdb");
+        (blob_offset, blob_vaddr, output_phoff)
     };
 
     // Rebuilt section metadata (never loaded, appended past the new segment): the extended
@@ -420,7 +440,7 @@ fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     let name_off = strtab.len() as u32;
     let mut new_strtab = strtab.clone();
     new_strtab.extend_from_slice(b"symdb\0");
-    let new_strtab_off = blob_offset + blob.len() as u64;
+    let new_strtab_off = (data.len() as u64).max(blob_offset + blob.len() as u64);
     let new_shoff = align_up(new_strtab_off + new_strtab.len() as u64, 8);
 
     shdrs[shstrndx].sh_offset = U64::new(LE, new_strtab_off);
@@ -443,27 +463,18 @@ fn elf_embed(mut data: Vec<u8>, blob: &[u8]) -> Result<Vec<u8>> {
     {
         let (ehdr, _) = object::pod::from_bytes_mut::<FileHeader64<LE>>(&mut data)
             .map_err(|_| anyhow::anyhow!("Truncated ELF header"))?;
-        if let Some(offset) = relocated_phoff {
-            ehdr.e_phoff = U64::new(LE, offset);
-            ehdr.e_phnum = U16::new(LE, phdrs.len() as u16);
-        }
+        ehdr.e_phoff = U64::new(LE, output_phoff as u64);
+        ehdr.e_phnum = U16::new(LE, phdrs.len() as u16);
         ehdr.e_shoff = U64::new(LE, new_shoff);
         ehdr.e_shnum = U16::new(LE, shdrs.len() as u16);
     }
 
-    if let Some(offset) = relocated_phoff {
-        data.resize(offset as usize, 0);
-        for phdr in &phdrs {
-            data.extend_from_slice(bytes_of(phdr));
-        }
-    } else {
-        for (index, phdr) in phdrs.iter().enumerate() {
-            let start = phoff + index * PHENT;
-            data[start..start + PHENT].copy_from_slice(bytes_of(phdr));
-        }
+    for (index, phdr) in phdrs.iter().enumerate() {
+        let start = output_phoff + index * PHENT;
+        data[start..start + PHENT].copy_from_slice(bytes_of(phdr));
     }
-    data.resize(blob_offset as usize, 0);
-    data.extend_from_slice(blob);
+    data.resize(new_strtab_off as usize, 0);
+    data[blob_offset as usize..blob_offset as usize + blob.len()].copy_from_slice(blob);
     data.extend_from_slice(&new_strtab);
     data.resize(new_shoff as usize, 0);
     for shdr in &shdrs {
@@ -681,9 +692,72 @@ mod tests {
         let output = elf_embed(input, b"manifest").unwrap();
         let (output_ehdr, output_phdrs) = elf_headers(&output);
 
-        assert_ne!(output_ehdr.e_phoff.get(LE), input_ehdr.e_phoff.get(LE));
+        assert_eq!(output_ehdr.e_phoff.get(LE), size_of::<FileHeader64<LE>>() as u64);
         assert_eq!(output_ehdr.e_phnum.get(LE), input_ehdr.e_phnum.get(LE) + 1);
         assert_eq!(output_phdrs[1].p_type.get(LE), elf::PT_NULL);
         assert_eq!(output_phdrs.last().unwrap().p_type.get(LE), elf::PT_LOAD);
+        assert_ne!(output_phdrs[2].p_offset.get(LE), 0);
+    }
+
+    #[test]
+    fn elf_embed_prepends_mapped_headers_without_changing_addresses() {
+        for phdr_types in [vec![elf::PT_PHDR, elf::PT_LOAD, elf::PT_GNU_STACK], vec![
+            elf::PT_LOAD,
+            elf::PT_GNU_STACK,
+        ]] {
+            let input = test_elf(&phdr_types);
+            let (_, input_phdrs) = elf_headers(&input);
+            let blob = vec![0x5a; 0x2001];
+            let output = elf_embed(input.clone(), &blob).unwrap();
+            let (ehdr, phdrs) = elf_headers(&output);
+            let phdr_size = phdrs.len() * size_of::<ProgramHeader64<LE>>();
+            let header_load = phdrs.last().unwrap();
+            let phdr = &phdrs[0];
+
+            assert_eq!(ehdr.e_phoff.get(LE), size_of::<FileHeader64<LE>>() as u64);
+            assert_eq!(header_load.p_type.get(LE), elf::PT_LOAD);
+            assert_eq!(header_load.p_offset.get(LE), 0);
+            assert_eq!(header_load.p_vaddr.get(LE), 0x1000);
+            assert_eq!(phdr.p_type.get(LE), elf::PT_PHDR);
+            assert_eq!(phdr.p_offset.get(LE), ehdr.e_phoff.get(LE));
+            assert_eq!(phdr.p_vaddr.get(LE), 0x1000 + ehdr.e_phoff.get(LE));
+            assert_eq!(phdr.p_filesz.get(LE), phdr_size as u64);
+
+            let original_load = phdrs.iter().find(|p| p.p_type.get(LE) == elf::PT_LOAD).unwrap();
+            let shift = original_load.p_offset.get(LE);
+            assert_eq!(shift % original_load.p_align.get(LE), 0);
+            assert_eq!(original_load.p_vaddr.get(LE), 0);
+            assert_eq!(original_load.p_paddr.get(LE), 0);
+            assert_eq!(
+                original_load.p_memsz.get(LE),
+                input_phdrs
+                    .iter()
+                    .find(|p| p.p_type.get(LE) == elf::PT_LOAD)
+                    .unwrap()
+                    .p_memsz
+                    .get(LE)
+            );
+            assert_eq!(
+                &output[shift as usize..shift as usize + DESCRIPTOR_OFFSET],
+                &input[..DESCRIPTOR_OFFSET]
+            );
+
+            let file = object::File::parse(&*output).unwrap();
+            let descriptor = file.section_by_name("symdbh").unwrap();
+            let symdb = file.section_by_name("symdb").unwrap();
+            assert_eq!(descriptor.address(), DESCRIPTOR_OFFSET as u64);
+            assert_eq!(descriptor.file_range().unwrap().0, DESCRIPTOR_OFFSET as u64 + shift);
+            assert_eq!(symdb.data().unwrap(), blob);
+            assert_eq!(symdb.address(), 0x1000 + symdb.file_range().unwrap().0);
+            assert_eq!(
+                u64::from_le_bytes(descriptor.data().unwrap()[8..16].try_into().unwrap()),
+                symdb.address()
+            );
+            assert!(symdb.file_range().unwrap().0 >= ehdr.e_phoff.get(LE) + phdr_size as u64);
+            assert_eq!(
+                header_load.p_filesz.get(LE),
+                symdb.file_range().unwrap().0 + blob.len() as u64
+            );
+        }
     }
 }
