@@ -261,16 +261,20 @@ fn read_pdb(path: &Path, root: &SourceRoot) -> Result<ManifestInput> {
         Default::default()
     });
 
-    let provenance = provenance::BuildInfo::read(&mut pdb)?;
+    let provenance = provenance::BuildInfo::read(&mut pdb).unwrap_or_else(|e| {
+        log::debug!("PDB build-info scan unavailable ({e:#}); some TU aliases may be omitted");
+        Default::default()
+    });
     let strings = pdb.string_table().ok();
     let mut modules = dbi.modules()?;
     while let Some(module) = modules.next()? {
         let Some(module_info) = pdb.module_info(&module)? else {
             continue;
         };
-        let source = provenance
-            .source(&module_info, strings.as_ref(), root)
-            .with_context(|| format!("TU provenance for PDB module '{}'", module.module_name()))?;
+        let source = provenance.source(&module_info, strings.as_ref(), root).unwrap_or_else(|e| {
+            log::debug!("Skipping TU aliases for PDB module '{}': {e:#}", module.module_name());
+            None
+        });
         let mut sym_iter = module_info.symbols()?;
         while let Some(symbol) = sym_iter.next()? {
             let Ok(data) = symbol.parse() else { continue };
